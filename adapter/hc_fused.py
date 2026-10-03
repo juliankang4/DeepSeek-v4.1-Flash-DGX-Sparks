@@ -43,11 +43,12 @@ logger = logging.getLogger(__name__)
 ENABLED = os.environ.get("DSV41_HC_FUSED", "0").strip() not in ("0", "", "off", "false")
 MIN_ROWS = int(os.environ.get("DSV41_HC_FUSED_MIN_ROWS", "512"))
 
-# sha256[:16] of the stock sources this kernel reproduces (sglang dsv4.1 f80c91a4b), Triton 3.7.1
+# sha256[:16] of the stock sources this kernel reproduces (sglang v0.5.21 e00930c5), Triton 3.7.1.
+# From f80c91a4b only docstrings and a HIP-only branch changed; the CUDA path is the same.
 _EXPECTED = {
-    "_hc_mix_stats_partial_kernel": "869788ff0152119b",
-    "_hc_mix_reduce_sinkhorn_kernel": "be4af40b07b7396d",
-    "hc_mix_stats_sinkhorn": "a65077c012452c36",
+    "_hc_mix_stats_partial_kernel": "ca7ec34b9be7abd7",
+    "_hc_mix_reduce_sinkhorn_kernel": "8e9e13a25eb9885e",
+    "hc_mix_stats_sinkhorn": "8ed53dab69e71a3d",
     "_num_slices_for": "23e78e75dc040b8e",
 }
 _TRITON = "3.7.1"

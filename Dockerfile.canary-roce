@@ -23,6 +23,10 @@ RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.
 # RoCEnante overlay (SG17, rhys101) applied to the branch tree with offsets, then adapted to TP4
 COPY runtime/sglang-rocenante.patch runtime/roce_tp4_adapt.py /tmp/
 RUN cd /sgl-workspace/sglang && patch -p1 -F3 < /tmp/sglang-rocenante.patch && python3 /tmp/roce_tp4_adapt.py && rm /tmp/sglang-rocenante.patch /tmp/roce_tp4_adapt.py
+# GB10 (SM12x): v0.5.21's V4.1 candidate indexer needs DeepGEMM paged sparse MQA logits, which are
+# SM100-only; route SM12x to the dense block ids (the Hopper path) instead of refusing to start.
+COPY runtime/sglang-v0521-gb10.patch /tmp/
+RUN cd /sgl-workspace/sglang && patch -p1 --forward < /tmp/sglang-v0521-gb10.patch && rm /tmp/sglang-v0521-gb10.patch
 COPY --from=fetch /fetched/b12x/b12x /opt/b12x/b12x
 COPY --from=fetch /fetched/b12x/LICENSE /opt/b12x/LICENSE
 RUN PYTHONPATH=/opt/b12x python3 -c "from b12x.comm import roce; print('roce', roce.API_VERSION)"

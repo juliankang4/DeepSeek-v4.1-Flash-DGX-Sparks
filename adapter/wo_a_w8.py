@@ -420,10 +420,14 @@ def install_model(dsv4_module):
     if not ENABLED:
         return
     import importlib
-    try:
-        kern = importlib.import_module("sglang.kernels.ops.attention.dsv4.wo_a_bf16")
-    except ModuleNotFoundError:
-        kern = None
+    kern = None
+    # v0.5.21 moved the small-batch kernels to sglang.kernels.ops.gemm.dsv4_wo_a
+    for name in ("sglang.kernels.ops.gemm.dsv4_wo_a", "sglang.kernels.ops.attention.dsv4.wo_a_bf16"):
+        try:
+            kern = importlib.import_module(name)
+            break
+        except ModuleNotFoundError:
+            pass
     if kern is not None and hasattr(kern, "wo_a_bf16_small_batch"):
         _patch_kernels(dsv4_module, kern)
         install_mid(dsv4_module)
