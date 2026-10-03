@@ -31,7 +31,9 @@ RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.
 COPY runtime/sglang-rocenante.patch runtime/roce_tp4_adapt.py /tmp/
 RUN cd /sgl-workspace/sglang && patch -p1 -F3 < /tmp/sglang-rocenante.patch && python3 /tmp/roce_tp4_adapt.py && rm /tmp/sglang-rocenante.patch /tmp/roce_tp4_adapt.py
 # GB10 (SM12x): v0.5.21's V4.1 candidate indexer needs DeepGEMM paged sparse MQA logits, which are
-# SM100-only; route SM12x to the dense block ids (the Hopper path) instead of refusing to start.
+# SM100-only. The patch keeps upstream prefill (dense block ids) and brings back the dsv4.1-branch
+# decode path for SM12x (DeepGEMM paged fp4 logits + two-level page masks), plus the SG18 indexer
+# row split across TP ranks (SPARK_PREFILL_TP_SPLIT).
 COPY runtime/sglang-v0521-gb10.patch /tmp/
 RUN cd /sgl-workspace/sglang && patch -p1 --forward < /tmp/sglang-v0521-gb10.patch && rm /tmp/sglang-v0521-gb10.patch
 COPY --from=fetch /fetched/b12x/b12x /opt/b12x/b12x
@@ -68,7 +70,8 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.p
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_autotune_keep.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_replicated_split.py \
  && CUDA_VISIBLE_DEVICES= VC_TEST_N=60000 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_verify_cap.py \
- && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_roce_ring.py
+ && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_roce_ring.py \
+ && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_v0521_gb10_indexer.py /sgl-workspace/sglang/python /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv4/candidate_blocks.py
 ENV PYTHONPATH=/opt/dsv41/adapter:/opt/b12x:/opt/b12x_next \
     MODEL_PATH=/models/DeepSeek-V4.1-Flash \
     STATE_PATH=/state OFFLOAD_MODE=nvme DSV41_CACHE_GIB=16
