@@ -17,9 +17,16 @@ FROM lmsysorg/sglang:v0.5.21@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c
 # Same mirror knob as Dockerfile.canary (Saolence, #6): --build-arg PIP_INDEX=<mirror>/simple
 ARG PIP_INDEX=https://pypi.org/simple
 RUN pip install --no-deps --no-cache-dir -i "$PIP_INDEX" "sglang-kernel==0.4.7" "sgl-deep-gemm==0.2.0"
+# v0.5.21 ships prebuilt Rust extensions in the python tree (the default prefix-cache core, server,
+# multimodal, gRPC) and the image runs with SGLANG_RUST_BUILD_MODE=never. Keep them across the tree
+# swap; they only fit the commit they were built from, so the base and the fetched tree must match.
+RUN cd /sgl-workspace/sglang/python && find . -name '*.so' > /tmp/sglang-ext.list && tar -cf /tmp/sglang-ext.tar -T /tmp/sglang-ext.list
 RUN rm -rf /sgl-workspace/sglang/python
 COPY --from=fetch /fetched/sglang-canary/python /sgl-workspace/sglang/python
-RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark; print('import ok')"
+COPY --from=fetch /fetched/sglang-canary/REF /tmp/sglang-ref
+RUN test "$SGLANG_BUILD_COMMIT" = "$(cat /tmp/sglang-ref)" \
+ && tar -xf /tmp/sglang-ext.tar -C /sgl-workspace/sglang/python && rm /tmp/sglang-ext.tar /tmp/sglang-ext.list /tmp/sglang-ref
+RUN python3 -c "import sglang, sglang.srt.models.deepseek_v4, sglang.srt.layers.attention.deepseek_v4_backend, sglang.srt.models.deepseek_v4_dspark, sglang.srt.mem_cache.rust_tree_core.mem_cache; print('import ok')"
 # RoCEnante overlay (SG17, rhys101) applied to the branch tree with offsets, then adapted to TP4
 COPY runtime/sglang-rocenante.patch runtime/roce_tp4_adapt.py /tmp/
 RUN cd /sgl-workspace/sglang && patch -p1 -F3 < /tmp/sglang-rocenante.patch && python3 /tmp/roce_tp4_adapt.py && rm /tmp/sglang-rocenante.patch /tmp/roce_tp4_adapt.py
