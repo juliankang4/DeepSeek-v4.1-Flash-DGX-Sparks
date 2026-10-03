@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import inspect
 import types
 
 os.environ["DSV41_FAST_LOAD"] = "1"
@@ -97,11 +98,14 @@ def engine_copy(lw, proj, moe_tp_rank, moe_tp_size, shape):
     ed = torch.zeros(ed_shape, dtype=torch.uint8).view(lw.dtype)
     if FusedMoE is not None:
         fake = types.SimpleNamespace(
-            moe_tp_size=moe_tp_size, moe_runner_config=types.SimpleNamespace(is_gated=True),
+            moe_tp_rank=moe_tp_rank, moe_tp_size=moe_tp_size, moe_runner_config=types.SimpleNamespace(is_gated=True),
             quant_method=types.SimpleNamespace(load_up_proj_weight_first=True), use_padded_loading=False,
             use_presharded_weights=False, use_triton_kernels=False, quant_config=None)
         loader = FusedMoE._load_w2 if proj == "w2" else FusedMoE._load_w13
-        loader(fake, expert_data=ed, shard_dim=shard_dim, shard_id=proj, loaded_weight=lw, tp_rank=moe_tp_rank)
+        kwargs = dict(expert_data=ed, shard_dim=shard_dim, shard_id=proj, loaded_weight=lw)
+        if "tp_rank" in inspect.signature(loader).parameters:  # SGLang before #41814 passed the rank
+            kwargs["tp_rank"] = moe_tp_rank
+        loader(fake, **kwargs)
     else:
         ls = lw.shape[shard_dim] // moe_tp_size
         src = lw.narrow(shard_dim, ls * moe_tp_rank, ls)
