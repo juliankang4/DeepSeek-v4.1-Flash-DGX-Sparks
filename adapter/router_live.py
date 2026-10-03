@@ -31,9 +31,10 @@ _SUBS = [
      "    row_ptr = scores_ptr + src_m[:, None] * stride_sm + offs_n[None, :] * stride_sn\n"),
     ("        input_ids = tl.load(\n            input_ids_ptr + offs_m * stride_input_ids, mask=live_m, other=0\n        )\n",
      "        input_ids = tl.load(\n            input_ids_ptr + src_m * stride_input_ids, mask=live_m, other=0\n        )\n"),
-    # python wrapper: accept live=, stride= and pass them on
-    ("    packed_out: Optional[torch.Tensor] = None,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n",
-     "    packed_out: Optional[torch.Tensor] = None,\n    live: Optional[torch.Tensor] = None,\n"
+    # python wrapper: accept live=, stride= and pass them on (v0.5.21 ends the parameters with
+    # sqrtsoftplus_log1p; its SQRTSOFTPLUS_LOG1P constexpr is carried by the copied source)
+    ("    sqrtsoftplus_log1p: bool = False,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n",
+     "    sqrtsoftplus_log1p: bool = False,\n    live: Optional[torch.Tensor] = None,\n"
      "    live_stride: int = 6,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n"),
 ]
 
