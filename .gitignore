@@ -1,6 +1,9 @@
 # Local configuration and secrets (copy .env.example to .env)
 .env
 .env.tp4
+# update-cycle fallback envs (known-good and the failed candidate)
+.env.tp4.last-good
+.env.tp4.failed-candidate
 state/
 state-tp4/
 *.pem
