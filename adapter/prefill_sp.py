@@ -15,11 +15,33 @@ rows: rank r owns rows [r*M/W, (r+1)*M/W).
                agreed over TP with MIN, full-M fallback)
   hc post / combine / norm / stats: stock code on the shard; every kernel choice that the
                engine keys on the row count is keyed on the FULL chunk row count
-               (sp_logical_rows(), used by _hc_combine / hc_post here, by hc_fused and by
-               hc_prefill_fused)
+               (sp_logical_rows(), used by _hc_combine / hc_post / _hc_post_with_combine here,
+               by hc_fused and by hc_prefill_fused)
   layer 21   : the tail rows of R and prev_pre are gathered (byte copy) and the late layers
                run stock
   no tail    : R and the last pre are gathered at exit
+
+SGLang v0.5.21 prefill paths for 4096 <= M <= 65536 rows, and what happens to them here
+  post+combine(+norm)  _hc_post_with_combine fuses hc_post with the next sublayer's collapse
+               (and RMSNorm): after attention always, after the MoE when the next layer takes
+               the cross-layer hand-off (combined= / normalized=). The gate keys on the chunk
+               row count M here. On the shard the post/combine is the engine's own Triton
+               _mhc_post_combine and the norm its _hc_norm_prefill (both one row per program,
+               no row-count check), which is what the engine itself runs for these rows when
+               the 16-byte alignment check fails; the fused CUDA kernel it prefers refuses
+               fewer than 4096 rows. That the two are bit-identical is the engine's design,
+               CHECKED here, not assumed: the first chunk of every size compares the shard result
+               with the stock fused kernel on the gathered rows, agrees over TP (MIN), and on any
+               difference serves that chunk exactly (gathered stock) and runs later chunks of that
+               size stock (no SP).
+  cross-layer collapse  the copied loop takes the engine's decision (Engram-free next layer,
+               no bounded-replay tail, extend) on M, so the shard runs it whenever stock does.
+               Under bounded replay (production) the engine never takes it during prefill.
+  prefill stats stream  the hc stats of a sublayer go to a side stream and start just before
+               the sublayer's all-reduce (MhcPostFusion overlap_only, which moves the attention
+               all-reduce out of wo_b). Inside the region there is no such all-reduce to overlap
+               (it is a reduce-scatter here), so _get_hc_stats_stream answers None there and the
+               stats run on the current stream: the same kernels, so the same bits.
 
 Modes
   DSV41_PREFILL_SP=comm  P0, transport only: nothing is sharded; the same three reduction sites
@@ -41,6 +63,8 @@ forward mode and static config, so it is identical on every rank.
 Drift guard: sha256[:16] of the engine sources this relies on are checked at install; any
 difference raises (refuses to boot). hc_prefill_fused, when enabled, must key its gates on
 sp_logical_rows() (it declares SP_LOGICAL_ROWS = True); otherwise install raises.
+
+Engine: SGLang v0.5.21 (+ RoCE and GB10 patches). Ported from the dsv4.1 f80c91a4b version.
 """
 import hashlib
 import inspect
@@ -83,34 +107,51 @@ if "compare" in DEBUG:
 DEBUG_CHUNKS = int(os.environ.get("DSV41_PREFILL_SP_DEBUG_CHUNKS", "64"))
 DEBUG_DUMP = os.environ.get("DSV41_PREFILL_SP_DEBUG_DUMP", "").strip()
 
-# Engine sources (sglang dsv4.1 f80c91a4b as in dsv41-4x-spark:ds41-verify-0924d), sha256[:16]
-# of inspect.getsource(inspect.unwrap(obj)). The loop below is a copy of the first; the others
-# are the call sites and kernel gates whose behaviour the exactness argument depends on.
+# Engine sources (SGLang v0.5.21 + RoCE + GB10 patches), sha256[:16] of
+# inspect.getsource(inspect.unwrap(obj)). The loop below is a copy of the first; the others are
+# the call sites and kernel gates whose behaviour the exactness argument depends on.
+# Values computed from the v0.5.21 source tree, NOT yet in the image: confirm with
+# NEW_HASHES.md's script before shipping (a difference refuses to boot, it never runs wrong).
 _EXPECTED = {
-    "v4.DeepseekV4Model._forward_layers_hc_pre_from_prev": "bc059d80f038e7f8",
-    "v4.DeepseekV4DecoderLayer.forward_hc_pre_from_prev": "49dc092d369923cf",
-    "v4.DeepseekV4DecoderLayer._hc_combine": "da5688eff1cf6fab",
-    "v4.DeepseekV4DecoderLayer._hc_mix_stats": "0a6edf4b45cd160b",
-    "v4.DeepseekV4DecoderLayer.hc_post": "8adb8062e8e66c31",
-    "v4.DeepseekV4DecoderLayer._run_moe_ffn_dp_sync": "065622659105f3fe",
-    "v4.DeepseekV4Model.forward": "3ab2a4745377b83b",
-    "v4.MQALayer.forward": "d21dfc6533e96207",
-    "v2.DeepseekV2MoE.forward": "d931dfa4d2acacd8",
-    "v2.DeepseekV2MoE.forward_normal": "9da361af16dafbec",
-    "engram.Engram.forward": "841b358015e044b8",
-    "engram.EngramEmbedding.forward": "b2f3ea98879b9437",
-    "engram.EngramEmbedding._lookup": "66a0f98a49fcd266",
-    "hcn.hc_combine_norm": "afa73fe49eb1d4b0",
+    "v4.DeepseekV4Model._forward_layers_hc_pre_from_prev": "64f2801ffd57d158",
+    "v4.DeepseekV4DecoderLayer.forward_hc_pre_from_prev": "49f22482d5370465",
+    "v4.DeepseekV4DecoderLayer._hc_combine": "02b26ea5f805ed54",
+    "v4.DeepseekV4DecoderLayer._hc_mix_stats": "a94d95cd06bd9676",
+    "v4.DeepseekV4DecoderLayer.hc_post": "5f5dc4cf67cf091b",
+    "v4.DeepseekV4DecoderLayer._hc_post_with_combine": "0a23e4a2729b5adc",
+    "v4.DeepseekV4DecoderLayer._get_hc_stats_stream": "9a92da0e2ce75ab9",
+    "v4.DeepseekV4DecoderLayer._run_moe_ffn_dp_sync": "1100ee58ff5fc3ff",
+    "v4.DeepseekV4Model.forward": "8fe30b4e1874a893",
+    "v4.MQALayer.forward": "78d101dc4c4baec9",
+    "v2.DeepseekV2MoE.forward": "79f4c814db857b0d",
+    "v2.DeepseekV2MoE.forward_normal": "6771a662f03d71ab",
+    "engram.Engram.forward": "19df65b564f45d15",
+    "engram.EngramEmbedding.forward": "138d015825c95c0e",
+    "engram.EngramEmbedding._lookup": "bd991c49e8e3e8dc",
+    "engram.engram_gate": "34b0bfeb52ab1218",
+    "hcn.hc_combine_norm": "f6dfc00796090fc3",
     "hcn._hc_combine_norm_prefill": "74f71ebf85b010ee",
-    "linear.RowParallelLinear.forward": "30be12725b32806b",
+    "mpc.mhc_post_combine": "a3f32180a2fbe7c8",
+    "mpc._mhc_post_combine": "a634b84e16d3fbbb",
+    "mpc.hc_norm_prefill": "33aacdba1d46530c",
+    "mpc._hc_norm_prefill": "dea91349eed3279d",
+    "mpcn.mhc_post_combine_norm_prefill": "6b353220faf832f0",
+    "linear.RowParallelLinear.forward": "6e429216a343a251",
+}
+# Non-Python engine sources (sha256[:16] of the file text), relative to sglang/kernels/jit/csrc:
+# the fused prefill post/combine/norm kernel the shard's Triton pair is checked against.
+_EXPECTED_FILES = {
+    "deepseek_v4/mhc_post_combine_norm_prefill.cuh": "a8805d1f7b8a2ebc",
 }
 
 
 # sglang.srt.layers.attention.deepseek_v4_backend: the tail-row semantics _tail_rows reproduces.
 # Stage 2 additionally relies on these (checked at install when DSV41_PREFILL_SP_FP8=1): which
 # inputs attention's prefill path reads, and when it takes a pre-quantized input.
+# v0.5.21 changed only _forward_prepare, in its CP and NPU branches (excluded by the plan / CUDA);
+# the CUDA non-CP path still reads x only through wqkv_a (x_linear) plus x.dtype / x.shape.
 _EXPECTED_FP8 = {
-    "v4.MQALayer._forward_prepare": "b3adfe1a07ee6127",
+    "v4.MQALayer._forward_prepare": "33d18c9cc577a883",
     "v4.MQALayer.accepts_mxfp8_swizzled_input": "5bb4fddfc5b329ca",
     "v4.MQALayer._compute_kv_to_cache": "f52f600c4986428c",
     "v4.MQALayer._compute_kv_bf16": "00c4ab90b403d1e9",
@@ -134,9 +175,27 @@ _ctx = _Ctx()
 _M = {}                         # engine modules, filled by install
 _STATIC = {"checked": False}
 _WKV_OK = {}                    # (layer_id, M) -> bool (agreed over TP)
+_PCN_OK = {}                    # M -> bool: shard post+combine+norm == stock fused (agreed over TP)
 _SEEN_M = set()
 _REQUIRE_CUDA = True            # CPU tests switch this off
 _DBG = {"chunks": 0, "dumped": 0}
+
+
+def _tp_group():
+    """The TP GroupCoordinator. v0.5.21 deprecates get_tp_group() (deepseek_v4 no longer imports
+    it); it is get_parallel().tp_group, the group every engine all-reduce here runs on (_ATTN_TP
+    and _MOE_TP are this same object at attn_tp == moe_tp == tp)."""
+    return _M["v4"].get_parallel().tp_group
+
+
+def _no_mhc_fusion():
+    """Clear the MhcPostFusion hand-off around a gathered attention / MoE call. In v0.5.21 a set
+    overlap_only fusion makes MQALayer run its all-reduce outside wo_b (attn_tp_all_reduce), which
+    would reduce what this adapter reduce-scatters. The region never sets one (no stats stream,
+    and the fused ones are for <= 8 / 128..384-row decode and verify), so this is a guard: with it
+    cleared the layer still materializes its stats from the fusion object after the call."""
+    mpf = _M.get("mpf")
+    return mpf.use_mhc_post_fusion(None) if mpf is not None else nullcontext()
 
 
 def _agree_min(p, local):
@@ -260,7 +319,7 @@ def _debug_begin(model, hidden_states, forward_batch, input_ids, p):
     if not forward_batch.forward_mode.is_extend_without_speculative():
         return None
     _DBG["chunks"] += 1
-    rank = p.rank if p is not None else _M["v4"].get_tp_group().rank_in_group
+    rank = p.rank if p is not None else _tp_group().rank_in_group
     d = _Dbg(_DBG["chunks"], hidden_states.shape[0], p, rank)
     if rank == 0:
         lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
@@ -446,23 +505,42 @@ def engine_hashes():
     return {k: _src_hash(_resolve(k)) for k in _EXPECTED}
 
 
+def _file_hash(rel):
+    path = os.path.join(_M["jit_csrc"], rel)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        return f"unreadable ({exc.__class__.__name__})"
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
 def check_engine():
     exp = dict(_EXPECTED)
     if FP8:
         exp.update(_EXPECTED_FP8)
     got = {k: _src_hash(_resolve(k)) for k in exp}
     bad = [f"{k} {got[k]} != {exp[k]}" for k in got if exp[k] != got[k]]
+    for rel, want in _EXPECTED_FILES.items():
+        have = _file_hash(rel)
+        if have != want:
+            bad.append(f"csrc/{rel} {have} != {want}")
     if bad:
         raise RuntimeError("DSV41_PREFILL_SP: engine source drifted, refusing to run: " + "; ".join(bad))
 
 
 def _load_modules(model_mod):
+    import sglang.kernels.jit as jit
     from sglang.kernels.ops.layernorm import hc_combine_norm as hcn
     from sglang.kernels.ops.layernorm import mhc
+    from sglang.kernels.ops.layernorm import mhc_post_combine as mpc
+    from sglang.kernels.ops.layernorm import mhc_post_combine_norm_prefill as mpcn
     from sglang.srt.layers import engram, linear
+    from sglang.srt.layers.moe import mhc_post_fusion as mpf
     from sglang.srt.models import deepseek_v2 as v2
 
-    _M.update(v4=model_mod, v2=v2, engram=engram, hcn=hcn, mhc=mhc, linear=linear)
+    _M.update(v4=model_mod, v2=v2, engram=engram, hcn=hcn, mhc=mhc, linear=linear, mpc=mpc,
+              mpcn=mpcn, mpf=mpf, jit_csrc=os.path.join(os.path.dirname(jit.__file__), "csrc"))
 
 
 def _check_hc_prefill_fused():
@@ -541,7 +619,7 @@ def _static_check(model, world):
     if FP8 and MODE == "shard" and world > 1:
         fp8_layers = [i for i in range(model.start_layer, last)
                       if fp8_eligible_attn(model.layers[i].self_attn)]
-        if _M["v4"].get_tp_group().rank_in_group == 0:
+        if _tp_group().rank_in_group == 0:
             print(f"DSV41_PREFILL_SP fp8 attention gather on layers {fp8_layers} "
                   f"({len(fp8_layers)} of {last - model.start_layer}; the rest gather bf16)", flush=True)
     _STATIC["checked"] = True
@@ -563,10 +641,12 @@ def _plan(model, hidden_states, forward_batch):
     if not (hidden_states.dim() == 3 and hidden_states.dtype == torch.bfloat16
             and (hidden_states.is_cuda or not _REQUIRE_CUDA) and hidden_states.is_contiguous()):
         return None
-    group = v4.get_tp_group()
+    group = _tp_group()
     rows, world = hidden_states.shape[0], group.world_size
     if not eligible_rows(rows, world):
         return None
+    if MODE == "shard" and _PCN_OK.get(rows) is False:
+        return None             # the shard post+combine+norm differed from stock at this size
     if not _STATIC["checked"]:
         _static_check(model, world)
     sharded = MODE == "shard"
@@ -613,13 +693,19 @@ def _engram_lookup_partial(engram, ids):
     return embed._owned_rows(ids), True
 
 
+def _engram_gate(engram, x, kv):
+    """The gate Engram.forward applies (v0.5.21 calls engram_gate directly; apply_gate is gone)."""
+    return _M["engram"].engram_gate(x, kv, engram.q_weight, engram.k_weight, engram.eps,
+                                    engram.clamp_value)
+
+
 def _sp_engram(p, engram, x, ids, forward_batch=None):
     """Stock Engram.forward on a shard of x: lookup on all rows, reduce, wkv + gate on rows."""
     emb, partial = _engram_lookup_partial(engram, ids)
     if p.sharded:
         emb = _reduce_rows(p, emb) if partial else emb[p.lo:p.hi]
         kv = _wkv_shard(p, engram, emb)
-        out = engram.apply_gate(x, kv.contiguous())
+        out = _engram_gate(engram, x, kv.contiguous())
         if _comparing():
             with _Inner():
                 xg = _gather_rows(p, x)
@@ -633,7 +719,7 @@ def _sp_engram(p, engram, x, ids, forward_batch=None):
     if partial:                 # P0: reduce-scatter + all-gather in place of the all-reduce
         emb = _reduce_out(p, emb)
     kv, _ = engram.wkv(emb.flatten(-2))
-    return engram.apply_gate(x, kv)
+    return _engram_gate(engram, x, kv)
 
 
 # ------------------------------------------------------------------------------------------
@@ -643,6 +729,8 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
                        input_ids_global, capture_dspark, dspark_aux_hidden_states):
     v4 = _M["v4"]
     assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+    # The plan excludes prefill CP (whole-prompt hashing, cp_all_tokens) and breakable CUDA
+    # graphs (graph-side hash ids): the engine's plain hasher call is the one that applies.
     hash_ids = None
     if self.engram_hasher is not None:
         hash_ids = self.engram_hasher(input_ids, forward_batch)
@@ -658,10 +746,14 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
     saved_full = None
     prev_pre = None
     precomputed_attn = None
+    combined_attn = None
+    normalized_attn = None
     _ctx.plan = p
     try:
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
+                combined_attn = None
+                normalized_attn = None
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 _ctx.plan = None
                 in_region = False
@@ -681,6 +773,8 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
             engram = self.layers[i].engram
             if engram is not None:
                 precomputed_attn = None
+                combined_attn = None
+                normalized_attn = None
                 before_engram = R
                 ids = hash_ids[:, engram.layer_hash_index]
                 if in_region:
@@ -708,8 +802,33 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
                 if v4.check_cuda_graph_backend(v4.Phase.PREFILL, v4.Backend.TC_PIECEWISE)
                 else v4.get_global_expert_distribution_recorder().with_current_layer(i)
             )
-            # next_norm / next_input only serve decode and verify (<= 8 rows): never here.
+            # Cross-layer collapse (v0.5.21): the next layer takes this layer's FFN post fused with
+            # its own input collapse (+ RMSNorm) when no Engram or row selection lies in between.
+            # The engine keys it on the row count: here on the chunk's (M), on every rank alike.
+            rows = p.rows if in_region else R.shape[0]
+            next_norm = None
             next_input = []
+            next_combined = (
+                []
+                if (
+                    self.config.model_type == "deepseek_v41"
+                    and (
+                        128 <= rows <= 384
+                        or (
+                            4096 <= rows <= 65536
+                            and forward_batch.forward_mode.is_extend_without_speculative()
+                        )
+                    )
+                    and i + 1 < self.end_layer
+                    and tail is None
+                    and self.layers[i + 1].engram is None
+                )
+                else None
+            )
+            if next_combined is not None and rows >= 4096:
+                next_norm = self.layers[i + 1].input_layernorm
+            # The engine's other next_norm (<= 8 rows, decode / target verify) never applies to a
+            # prefill chunk; next_input is only filled by those fused decode paths.
             with ctx:
                 R, prev_pre = self.layers[i].forward_hc_pre_from_prev(
                     positions=positions,
@@ -719,10 +838,16 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
                     input_ids_global=input_ids_global,
                     prev_pre=prev_pre,
                     precomputed_attn=precomputed_attn,
-                    next_norm=None,
+                    next_norm=next_norm,
                     next_input=next_input,
+                    combined_attn=combined_attn,
+                    normalized_attn=normalized_attn,
+                    next_combined=next_combined,
                 )
             precomputed_attn = next_input[0] if next_input else None
+            combined_attn, normalized_attn = (
+                next_combined[0] if next_combined else (None, None)
+            )
     finally:
         _ctx.plan = None
     if saved_full is not None:
@@ -877,7 +1002,8 @@ def _make_attn_forward(orig):
         _ctx.inner += 1
         _ctx.skip_wo_b = self.wo_b
         try:
-            o = orig(self, xf, positions, forward_batch, xq)
+            with _no_mhc_fusion():          # wo_b must own the (skipped) all-reduce
+                o = orig(self, xf, positions, forward_batch, xq)
         finally:
             _ctx.inner -= 1
             _ctx.skip_wo_b = None
@@ -913,7 +1039,9 @@ def _make_moe_forward(orig):
         x_ref = xf.clone() if _comparing() else None     # the MoE may write its input in place
         _ctx.inner += 1
         try:
-            with v4.get_forward().scoped(mlp_reduce_scatter=True):
+            # mlp_reduce_scatter=True: forward_normal skips post_experts_all_reduce (and with it
+            # the stats-stream start, which only precedes an all-reduce that runs)
+            with v4.get_forward().scoped(mlp_reduce_scatter=True), _no_mhc_fusion():
                 out = orig(self, xf, *args, **kwargs)
         finally:
             _ctx.inner -= 1
@@ -938,21 +1066,43 @@ def _make_moe_forward(orig):
 # ------------------------------------------------------------------------------------------
 # hc gates keyed on the logical row count (stage 1 only)
 # ------------------------------------------------------------------------------------------
-def _combine_norm_fused(layer, x, apply_pre, norm, m):
-    """The engine's _hc_combine fused-norm gate, evaluated at row count m."""
-    v4 = _M["v4"]
+def _in_shard(x):
+    """The plan when x is this rank's shard of a sharded chunk at the top level, else None."""
+    p = _ctx.plan
+    if p is None or _ctx.inner or not p.sharded or x.shape[0] != p.shard:
+        return None
+    return p
+
+
+def _batch_invariant():
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    return is_batch_invariant_mode_enabled()
+
+
+def _combine_norm_fused(layer, x, apply_pre, norm, m):
+    """The engine's _hc_combine fused-norm gate (apply_pre path), evaluated at row count m."""
+    v4 = _M["v4"]
     return bool(
         x.is_cuda
         and v4.get_platform().is_blackwell
-        and (0 < m <= 8 or (layer.config.model_type == "deepseek_v41" and 4096 <= m <= 65536))
+        and (0 < m <= 96 or (layer.config.model_type == "deepseek_v41" and 4096 <= m <= 65536))
         and layer.hc_mult == 4
         and x.flatten(1).shape[1] == 20480
         and x.dtype == norm.weight.dtype == torch.bfloat16
         and apply_pre.stride(1) == 1
         and not norm.cast_x_before_out_mul
         and norm.variance_size_override is None
-        and not is_batch_invariant_mode_enabled()
+        and not _batch_invariant()
+    )
+
+
+def _norm_prefill_gate(norm, m):
+    """The engine's _hc_combine gate for a collapsed (combined=) input, at row count m."""
+    return bool(
+        4096 <= m <= 65536
+        and norm.weight.dtype == torch.bfloat16
+        and not norm.cast_x_before_out_mul
+        and norm.variance_size_override is None
     )
 
 
@@ -971,33 +1121,89 @@ def hc_combine_norm_rows(x_flat, pre, weight, eps, logical_m):
     return y
 
 
+def norm_prefill_rows(combined, weight, eps, logical_m):
+    """mhc_post_combine.hc_norm_prefill on a row slice (its wrapper refuses < 4096 rows; the
+    kernel is one program per row)."""
+    mpc = _M["mpc"]
+    assert 4096 <= logical_m <= 65536 and combined.shape[1] == 5120
+    assert weight.shape == (5120,)
+    assert combined.dtype == weight.dtype == torch.bfloat16
+    assert combined.is_contiguous() and weight.is_contiguous()
+    out = torch.empty_like(combined)
+    if combined.shape[0]:
+        mpc._hc_norm_prefill[(combined.shape[0],)](combined, weight, out, eps, num_warps=4)
+    return out
+
+
+def post_combine_rows(x, residual, post, comb, pre, logical_m):
+    """mhc_post_combine on a row slice with the launch the full chunk (logical_m rows) uses.
+    Element-wise per (row, column): the block width only tiles the columns."""
+    mpc = _M["mpc"]
+    assert x.dtype == residual.dtype == torch.bfloat16
+    assert post.dtype == comb.dtype == pre.dtype == torch.float32
+    assert x.ndim == 2 and x.shape[1] == 5120
+    assert residual.shape == (x.shape[0], 4, x.shape[1])
+    assert post.shape == pre.shape == (x.shape[0], 4)
+    assert comb.shape == (x.shape[0], 4, 4)
+    assert all(t.is_contiguous() for t in (x, residual, post, comb, pre))
+    updated = torch.empty_like(residual)
+    combined = torch.empty_like(x)
+    if x.shape[0]:
+        block = 1024 if logical_m <= 192 or logical_m >= 4096 else 512
+        mpc._mhc_post_combine[(x.shape[0], (x.shape[1] + block - 1) // block)](
+            x, residual, post, comb, pre, updated, combined,
+            H=x.shape[1], B=block, num_warps=4, enable_fp_fusion=False,
+        )
+    return updated, combined
+
+
 def _make_hc_combine(orig):
     def _hc_combine(self, x, apply_pre, norm, stats_stream=None, quantized=None, normalized=None,
-                    precomputed=None):
-        p = _ctx.plan
-        if (p is None or _ctx.inner or not p.sharded or x.shape[0] != p.shard
-                or precomputed is not None or normalized is not None or stats_stream is not None):
-            return orig(self, x, apply_pre, norm, stats_stream, quantized, normalized, precomputed)
-        y = _sp_combine(self, orig, p, x, apply_pre, norm, quantized)
+                    precomputed=None, combined=None):
+        p = _in_shard(x)
+        if p is None or precomputed is not None:
+            return orig(self, x, apply_pre, norm, stats_stream, quantized, normalized, precomputed,
+                        combined)
+        if stats_stream is not None and torch.cuda.is_available():
+            # never set inside the region (see _make_stats_stream); keep the engine's ordering
+            # (a shard has >= 64 rows, so never the engine's "tiny" case)
+            stats_stream.wait_stream(torch.cuda.current_stream())
+        if normalized is not None:
+            # the engine returns it as is; its assert keys on the chunk's row count
+            assert quantized is None or 4096 <= p.rows <= 65536
+            return normalized
+        if combined is not None:
+            y = _sp_norm_combined(self, orig, p, x, norm, combined)
+        else:
+            y = _sp_combine(self, orig, p, x, apply_pre, norm, quantized)
         if _comparing():
             with _Inner():
                 xg = _gather_rows(p, x)
                 pg = _gather_rows(p, apply_pre) if apply_pre is not None else None
-                ref = orig(self, xg, pg, norm, None, None, None, None)[p.lo:p.hi].clone()
-                del xg, pg
+                cg = _gather_rows(p, combined) if combined is not None else None
+                ref = orig(self, xg, pg, norm, None, None, None, None, cg)[p.lo:p.hi].clone()
+                del xg, pg, cg
             which = "attn" if norm is getattr(self, "input_layernorm", None) else "ffn"
-            _cmp(f"hc_combine {which}{'' if apply_pre is not None else ' (stream 0)'}", y, ref,
-                 {"x": x, "pre": apply_pre})
+            what = " (collapsed)" if combined is not None else ("" if apply_pre is not None else " (stream 0)")
+            _cmp(f"hc_combine {which}{what}", y, ref, {"x": x, "pre": apply_pre})
         return y
+
+    def _sp_norm_combined(self, orig, p, x, norm, combined):
+        full = _norm_prefill_gate(norm, p.rows)
+        if full == _norm_prefill_gate(norm, combined.shape[0]):
+            return orig(self, x, None, norm, None, None, None, None, combined)
+        if full:
+            return norm_prefill_rows(combined, norm.weight, norm.variance_epsilon, p.rows)
+        return norm(combined)
 
     def _sp_combine(self, orig, p, x, apply_pre, norm, quantized):
         if apply_pre is None:
-            return orig(self, x, apply_pre, norm, None, quantized, None, None)
+            return orig(self, x, apply_pre, norm, None, quantized, None, None, None)
         m = p.rows
         full = _combine_norm_fused(self, x, apply_pre, norm, m)
         here = _combine_norm_fused(self, x, apply_pre, norm, x.shape[0])
         if full == here:
-            return orig(self, x, apply_pre, norm, None, quantized, None, None)
+            return orig(self, x, apply_pre, norm, None, quantized, None, None, None)
         x_flat = x.flatten(1)
         if full:
             return hc_combine_norm_rows(x_flat, apply_pre, norm.weight, norm.variance_epsilon, m)
@@ -1024,8 +1230,8 @@ def _post_split_h(layer, x, residual, post, comb, m):
 
 def _make_hc_post(orig):
     def hc_post(self, x, residual, post, comb):
-        p = _ctx.plan
-        if p is None or _ctx.inner or not p.sharded or x.shape[0] != p.shard:
+        p = _in_shard(x)
+        if p is None:
             return orig(self, x, residual, post, comb)
         out = _sp_post(self, x, residual, post, comb, p)
         if _comparing():
@@ -1047,13 +1253,148 @@ def _make_hc_post(orig):
             from flashinfer.mhc import mhc_post
             return mhc_post(x, residual, post, comb)
         if v4.envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            if v4.get_platform().is_sm90 and 1 <= p.rows <= 64:
+            if (self.hc_pre_from_prev_sublayer and v4.get_platform().is_sm90
+                    and 1 <= p.rows <= 64):
                 return v4.mhc_post_split_h(x, residual, post, comb)
             return _M["mhc"].mhc_post(x, residual, post, comb)
         raise RuntimeError("DSV41_PREFILL_SP: hc_post fallback chain not wired for this platform")
 
     hc_post.__wrapped__ = orig
     return hc_post
+
+
+def _post_combine_gate(layer, x, residual, post, comb, pre, forward_batch, m):
+    """The engine's _hc_post_with_combine outer gate (fused post + collapse), at row count m."""
+    v4 = _M["v4"]
+    mode = forward_batch.forward_mode
+    return bool(
+        layer.config.model_type == "deepseek_v41"
+        and x.is_cuda
+        and v4.get_platform().is_blackwell
+        and (
+            (128 <= m <= 384 and (mode.is_decode() or mode.is_target_verify()))
+            or (
+                4096 <= m <= 65536
+                and mode.is_extend_without_speculative()
+                and v4.envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+                and not v4.envs.SGLANG_OPT_USE_FLASHINFER_MHC.get()
+            )
+        )
+        and x.shape[1] == 5120
+        and layer.hc_mult == 4
+        and x.dtype == residual.dtype == torch.bfloat16
+        and post.dtype == comb.dtype == pre.dtype == torch.float32
+        and all(t.is_contiguous() for t in (x, residual, post, comb, pre))
+        and v4.get_parallel().attn_dp_size == 1
+        and not v4.get_forward().sp_active
+        and not layer.dsa_enable_prefill_cp
+        and not _batch_invariant()
+    )
+
+
+def _post_norm_ok(norm):
+    """The engine's choice of the fused post+collapse+RMSNorm, minus its 16-byte pointer check
+    (see _make_hc_post_with_combine)."""
+    return bool(
+        norm is not None
+        and not norm.cast_x_before_out_mul
+        and norm.variance_size_override is None
+        and norm.weight.dtype == torch.bfloat16
+        and norm.weight.shape == (5120,)
+        and norm.weight.is_contiguous()
+    )
+
+
+def _make_hc_post_with_combine(orig):
+    """v0.5.21's hc_post fused with the next sublayer's input collapse (+ norm), chosen on the
+    chunk's row count. With m >= 4096 and a norm the engine prefers the CUDA kernel
+    mhc_post_combine_norm_prefill (refuses < 4096 rows) and falls back to the Triton pair
+    mhc_post_combine + hc_norm_prefill when a pointer is not 16-byte aligned, i.e. it treats the
+    two as interchangeable. The shard always runs the Triton pair (no pointer-dependent branch, so
+    every rank takes the same path and the self-check collective below cannot diverge), and the
+    first chunk of every size checks it against the CUDA kernel on the gathered rows."""
+
+    def _hc_post_with_combine(self, x, residual, post, comb, pre, forward_batch, norm=None):
+        p = _in_shard(x)
+        if p is None:
+            return orig(self, x, residual, post, comb, pre, forward_batch, norm)
+        out = _sp(self, p, x, residual, post, comb, pre, forward_batch, norm)
+        if _comparing():
+            with _Inner():
+                ref = orig(self, _gather_rows(p, x), _gather_rows(p, residual), _gather_rows(p, post),
+                           _gather_rows(p, comb), _gather_rows(p, pre), forward_batch, norm)
+                ref = tuple(None if t is None else t[p.lo:p.hi].clone() for t in ref)
+            # the stock call may take the other (pointer-alignment) form: compare what both have
+            names = ("updated", "combined", "normalized")
+            for k in range(3):
+                if out[k] is not None and ref[k] is not None:
+                    _cmp(f"hc_post+combine {names[k]}", out[k], ref[k], {"x": x, "post": post})
+            del ref
+        return out
+
+    def _sp(self, p, x, residual, post, comb, pre, forward_batch, norm):
+        m = p.rows
+        full = _post_combine_gate(self, x, residual, post, comb, pre, forward_batch, m)
+        if not full:
+            # the chunk takes plain hc_post (our row-count-aware wrapper)
+            return self.hc_post(x, residual, post, comb), None, None
+        if m >= 4096 and _post_norm_ok(norm):
+            return _post_combine_norm(p, x, residual, post, comb, pre, norm)
+        updated, combined = post_combine_rows(x, residual, post, comb, pre, m)
+        return updated, combined, None
+
+    _hc_post_with_combine.__wrapped__ = orig
+    return _hc_post_with_combine
+
+
+def _post_combine_norm(p, x, residual, post, comb, pre, norm):
+    """(updated, None, normalized) for this rank's rows, bit-identical to the engine's fused
+    prefill kernel on the whole chunk: checked once per chunk size, agreed over TP."""
+    ok = _PCN_OK.get(p.rows)
+    if ok is False:             # this chunk started before the check failed: serve it exactly
+        u, n = _post_combine_norm_gathered(p, x, residual, post, comb, pre, norm)
+        return u, None, n
+    updated, combined = post_combine_rows(x, residual, post, comb, pre, p.rows)
+    normalized = norm_prefill_rows(combined, norm.weight, norm.variance_epsilon, p.rows)
+    del combined
+    if ok is None:
+        ref_u, ref_n = _post_combine_norm_gathered(p, x, residual, post, comb, pre, norm)
+        local = bool(torch.equal(updated, ref_u) and torch.equal(normalized, ref_n))
+        ok = _PCN_OK[p.rows] = _agree_min(p, local)
+        if p.rank == 0 and (len(_PCN_OK) <= 8 or not ok):
+            print(f"DSV41_PREFILL_SP post+combine+norm (M={p.rows}): shard Triton pair "
+                  f"{'equals the stock fused kernel on every rank -> ON' if ok else 'differs -> this chunk exact via gather, later chunks of this size run stock'}"
+                  f" (rank 0 local {local})", flush=True)
+        if not ok:
+            return ref_u, None, ref_n
+        del ref_u, ref_n
+    return updated, None, normalized
+
+
+def _post_combine_norm_gathered(p, x, residual, post, comb, pre, norm):
+    """The engine's fused kernel on the gathered chunk, this rank's rows (exact, expensive)."""
+    with _Inner():
+        u, n = _M["mpcn"].mhc_post_combine_norm_prefill(
+            _gather_rows(p, x), _gather_rows(p, residual), _gather_rows(p, post),
+            _gather_rows(p, comb), _gather_rows(p, pre), norm.weight, norm.variance_epsilon)
+    out = u[p.lo:p.hi].clone(), n[p.lo:p.hi].clone()
+    del u, n
+    return out
+
+
+def _make_stats_stream(orig):
+    """No prefill stats stream inside the region (any mode). The engine starts the sublayer's
+    stats just before its all-reduce, and for attention moves that all-reduce out of wo_b; here
+    the reduction is a reduce-scatter (or RS + all-gather) issued by this adapter. Stats on the
+    current stream run the same kernels on the same rows, so the bits are the stock bits."""
+    def _get_hc_stats_stream(self, hidden_states, forward_batch):
+        p = _ctx.plan
+        if p is not None and not _ctx.inner and hidden_states.shape[0] == p.in_rows:
+            return None
+        return orig(self, hidden_states, forward_batch)
+
+    _get_hc_stats_stream.__wrapped__ = orig
+    return _get_hc_stats_stream
 
 
 def _make_hc_mix_stats(orig):
@@ -1078,7 +1419,7 @@ def _make_hc_mix_stats(orig):
 # ------------------------------------------------------------------------------------------
 def install(model_mod):
     """sglang.srt.models.deepseek_v4. Must run BEFORE hc_prefill_fused.install, so that its
-    'stock' _hc_combine / hc_post are these logical-row-aware ones."""
+    'stock' _hc_combine / hc_post / _hc_post_with_combine are these logical-row-aware ones."""
     if MODE == "off" and not DEBUG:
         return
     if getattr(model_mod, "_dsv41_prefill_sp", False):
@@ -1113,9 +1454,12 @@ def install(model_mod):
     Model._forward_layers_hc_pre_from_prev = _forward_layers_hc_pre_from_prev
     model_mod.MQALayer.forward = _make_attn_forward(model_mod.MQALayer.forward)
     MoE.forward = _make_moe_forward(MoE.forward)
+    if MODE != "off":
+        Layer._get_hc_stats_stream = _make_stats_stream(Layer._get_hc_stats_stream)
     if MODE == "shard":
         Layer._hc_combine = _make_hc_combine(Layer._hc_combine)
         Layer.hc_post = _make_hc_post(Layer.hc_post)
+        Layer._hc_post_with_combine = _make_hc_post_with_combine(Layer._hc_post_with_combine)
         if "compare" in DEBUG:
             Layer._hc_mix_stats = _make_hc_mix_stats(Layer._hc_mix_stats)
     if DEBUG:
@@ -1131,7 +1475,8 @@ def install(model_mod):
             f"rows sharded over TP on the full-row layers, bf16 gathers"
             f"{', EXACT (all-reduce + keep the quarter)' if EXACT else ''}"
             f"{', MXFP8 attention-input gathers (checked per chunk size)' if FP8 else ''}"
-            f", wkv {'on the shard (self-checked)' if WKV_SHARD else 'full-M'}")
+            f", wkv {'on the shard (self-checked)' if WKV_SHARD else 'full-M'}"
+            f", post+combine+norm on the shard (self-checked per chunk size)")
     print(f"DSV41_PREFILL_SP={_RAW} ARMED: prefill chunks >= {MIN_ROWS} rows: {what}", flush=True)
     if EXACT and MODE == "comm":
         print("DSV41_PREFILL_SP: DSV41_PREFILL_SP_EXACT has no effect in comm mode", flush=True)

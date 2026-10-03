@@ -1,21 +1,35 @@
 """CPU check for adapter/prefill_sp.py: the row partition, the tail-row gathers, and the whole
-sharded layer loop against the engine's stock loop, with four TP ranks emulated by threads over
-a fake process group (all-gather = concatenation, all-reduce = rank-order bf16 sum, reduce-scatter
-= a different summation order, like NCCL's).
+sharded layer loop against the engine's stock loop (SGLang v0.5.21 structure), with four TP ranks
+emulated by threads over a fake process group (all-gather = concatenation, all-reduce = rank-order
+bf16 sum, reduce-scatter = a different summation order, like NCCL's).
 
 The model is a toy with the engine's structure: residual [M, 4, D], a row-mixing "attention"
 whose wo_b all-reduces unless told to skip, a hash-routed "MoE" that honours mlp_reduce_scatter,
-an Engram (owned-row lookup + all-reduce, wkv, gate), bounded replay (late layers on the tail
-rows), DSpark aux capture and the vision `where`. Its hc combine picks one of two numerically
-different reductions by row count (as the engine's >= 4096 fused norm does), keyed on
-sp_logical_rows(): a gate keyed on the shard size would change bits, and the test shows it.
+an Engram (owned-row lookup + all-reduce, wkv, engram_gate), bounded replay (late layers on the
+tail rows), DSpark aux capture and the vision `where`. v0.5.21's prefill paths for
+4096 <= M <= 65536 are modelled too:
+  * the prefill stats stream: with it the layer sets an overlap-only MhcPostFusion and the
+    attention runs its all-reduce outside wo_b (as MQALayer does), so a region that let it through
+    would reduce twice;
+  * _hc_post_with_combine: hc_post fused with the next sublayer's collapse + a "prefill" norm whose
+    rounding differs from the plain norm; the fused kernel is a separate callable (the CUDA kernel)
+    that the shard's pair (post_combine_rows + norm_prefill_rows, the Triton kernels) must match;
+  * the cross-layer collapse (combined= / normalized=) when no tail and no Engram intervene.
+The adapter's real wrappers for _hc_combine / hc_post / _hc_post_with_combine /
+_get_hc_stats_stream are installed on the toy; their GPU-only gates are swapped for toy ones.
+The toy's own apply_pre combine picks one of two numerically different reductions by row count
+keyed on sp_logical_rows() (what the adapter's _hc_combine achieves on GPU): a gate keyed on the
+shard size would change bits, and the test shows it.
 
-Checks, for several chunk sizes (4096, 2052 = odd shards, 2048 with a full-row tail, 2050 = not
-divisible, below MIN_ROWS) and tail layouts (one request, requests straddling shard boundaries,
-many short requests, no bounded replay):
+Checks, for several chunk sizes (8192 / 4096 = the v0.5.21 fused band, 2052 = odd shards, 2048
+with a full-row tail, 2050 = not divisible, below MIN_ROWS) and tail layouts (one request,
+requests straddling shard boundaries, many short requests, no bounded replay = cross-layer path):
   * stage 1 EXACT == stock, bit for bit, on every rank;
   * stage 1 fast == P0 (comm), bit for bit (same reduce-scatters on the same tensors);
   * P0 differs from stock only through the summation order (and matches it with an exact RS);
+  * the post+combine+norm self-check turns ON when the pair matches the fused kernel, and when it
+    does not, the chunk stays exact (gathered stock) and later chunks of that size run stock;
+  * without the stats-stream / fusion guards the attention reduces twice (the test is sensitive);
   * the wkv self-check falls back to the full-M GEMM when the shard GEMM is not bit-exact.
 
   PYTHONPATH=adapter python tests/test_prefill_sp.py
@@ -121,6 +135,8 @@ _fwd = threading.local()
 
 
 class _Forward:
+    sp_active = False
+
     @property
     def mlp_reduce_scatter(self):
         return getattr(_fwd, "mrs", False)
@@ -139,8 +155,81 @@ FORWARD = _Forward()
 GATE = {"logical": True}
 
 
+class _Fusion:
+    """sglang.srt.layers.moe.mhc_post_fusion: the scoped MhcPostFusion hand-off."""
+    _tl = threading.local()
+
+    @classmethod
+    def current(cls):
+        return getattr(cls._tl, "cur", None)
+
+    @classmethod
+    @contextmanager
+    def use_mhc_post_fusion(cls, state):
+        prev = getattr(cls._tl, "cur", None)
+        cls._tl.cur = state
+        try:
+            yield
+        finally:
+            cls._tl.cur = prev
+
+
 def hc_rows(x):
     return sp.sp_logical_rows(x) if GATE["logical"] else x.shape[0]
+
+
+class Norm:
+    """RMSNorm stand-in with the attributes the engine's gates read."""
+
+    def __init__(self, g):
+        self.weight = (1 + 0.2 * torch.randn(D, generator=g)).to(BF)
+        self.variance_epsilon = 1e-6
+        self.cast_x_before_out_mul = False
+        self.variance_size_override = None
+
+    def __call__(self, y):
+        yf = y.float()
+        return (yf * torch.rsqrt(yf.square().mean(-1, keepdim=True) + self.variance_epsilon)
+                * self.weight.float()).to(BF)
+
+
+# the v0.5.21 prefill kernels (row-local, as the engine's are)
+def toy_post(x, R, post, comb):
+    out = post.unsqueeze(-1) * x.float().unsqueeze(1) + (comb.unsqueeze(-1) * R.float().unsqueeze(2)).sum(1)
+    return out.to(BF)
+
+
+def toy_post_combine(x, R, post, comb, pre, logical_m=None):
+    """mhc_post_combine: updated streams (bf16) and their sequential collapse (bf16)."""
+    updated = toy_post(x, R, post, comb)
+    acc = torch.zeros(x.shape, dtype=torch.float32)
+    for c in range(4):
+        acc = acc + pre[:, c:c + 1] * updated[:, c].float()
+    return updated, acc.to(BF)
+
+
+def toy_norm_prefill(combined, weight, eps, logical_m=None):
+    """hc_norm_prefill: rounds differently from Norm.__call__ (weight folded into the scale)."""
+    yf = combined.float()
+    inv = torch.rsqrt((yf * yf).sum(-1, keepdim=True) / yf.shape[-1] + eps)
+    return (yf * (weight.float() * inv)).to(BF)
+
+
+def _fused_ok(x, R, post, comb, pre, weight, eps):
+    u, c = toy_post_combine(x, R, post, comb, pre)
+    return u, toy_norm_prefill(c, weight, eps)
+
+
+def _fused_bad(x, R, post, comb, pre, weight, eps):
+    u, n = _fused_ok(x, R, post, comb, pre, weight, eps)
+    return u, n.view(torch.int16).add(1).view(BF)       # one ulp off everywhere
+
+
+MPCN = SimpleNamespace(mhc_post_combine_norm_prefill=_fused_ok)   # the fused CUDA kernel
+
+
+def _prefill_band(m, fb):
+    return 4096 <= m <= 65536 and fb.forward_mode.is_extend_without_speculative()
 
 
 class RowParallel(torch.nn.Module):
@@ -171,11 +260,17 @@ class FakeAttn(torch.nn.Module):
         # causal row mixing: attention needs every earlier row
         h = x.float().cumsum(0) / torch.arange(1, x.shape[0] + 1).unsqueeze(1)
         h = (h * self.scale[self.group.rank_in_group]).to(BF)
-        o, _ = self.wo_b(h)
+        mhc = _Fusion.current()
+        o, _ = self.wo_b(h, skip_all_reduce=mhc is not None)
+        if mhc is not None:             # v0.5.21 overlap_only: attn_tp_all_reduce outside wo_b
+            o = self.group.all_reduce(o)
         return o
 
     def maybe_use_decode_attn_tp(self, fb):
         return nullcontext()
+
+    def accepts_mxfp8_swizzled_input(self):
+        return False
 
 
 class FakeMoE(torch.nn.Module):
@@ -192,7 +287,7 @@ class FakeMoE(torch.nn.Module):
         assert input_ids.shape[0] == hidden_states.shape[0], "hash routing needs every row's id"
         w = self.table[input_ids % 16, self.group.rank_in_group]
         out = (hidden_states.float() * torch.tanh(w)).to(BF)
-        if not FORWARD.mlp_reduce_scatter:
+        if not FORWARD.mlp_reduce_scatter:      # stats start (if any) does not change the sum
             out = self.group.all_reduce(out)
         return out
 
@@ -211,11 +306,20 @@ class FakeEmbed:
         return vals.masked_fill(~owned.unsqueeze(-1), 0)
 
 
+def fake_engram_gate(x, kv, q_weight, k_weight, eps, clamp_value):
+    """engram_gate stand-in: row-local, reads every argument the adapter passes."""
+    k = (kv.float() * q_weight.float() * k_weight.float()).clamp_min(-1 / clamp_value)
+    return (x.float() + torch.sigmoid(k + eps).unsqueeze(1)).to(x.dtype)
+
+
 class FakeEngram:
     def __init__(self, group, g, hash_index, m_dependent=False):
         self.group, self.layer_hash_index = group, hash_index
         self.embed = FakeEmbed(group, g, 97, 3, 8)
         self.wkv_w = torch.randn(24, D, generator=g) / 5
+        self.q_weight = 1 + 0.1 * torch.randn(D, generator=g)
+        self.k_weight = 1 + 0.1 * torch.randn(D, generator=g)
+        self.eps, self.clamp_value = 1e-6, 1e-6
         self.m_dependent = m_dependent
         self.wkv_calls = []
 
@@ -226,30 +330,43 @@ class FakeEngram:
             out = out * (1 + 2 ** -7)
         return out.to(BF), None
 
-    def apply_gate(self, x, kv):
-        return (x.float() + torch.sigmoid(kv.float()).unsqueeze(1)).to(x.dtype)
-
     def __call__(self, x, ids, forward_batch=None, cp_all_tokens=False):
         emb = self.group.all_reduce(self.embed._owned_rows(ids))
         kv, _ = self.wkv(emb.flatten(-2))
-        return self.apply_gate(x, kv)
+        return fake_engram_gate(x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value)
 
 
 class FakeLayer:
+    """DeepseekV4DecoderLayer's v0.5.21 prefill structure, numerics replaced by toys."""
+
     def __init__(self, group, g, layer_id, engram=None):
         self.layer_id = layer_id
         self.self_attn = FakeAttn(group, g)
         self.mlp = FakeMoE(group, g)
         self.engram = engram
         self.fn = torch.randn(2, 4, D, generator=g)
-        self.norm_w = torch.randn(D, generator=g)
+        self.input_layernorm, self.post_attention_layernorm = Norm(g), Norm(g)
         self.dsa_enable_prefill_cp = False
         self.use_fused_mhc_post_pre = False
+        self.hc_mult = 4
+        self.stats_stream_seen = []
 
-    def _hc_combine(self, R, pre):
-        if pre is None:
-            return R[:, 0, :].contiguous()
-        p = pre.float()
+    def _get_hc_stats_stream(self, hidden_states, forward_batch):
+        return "side-stream" if _prefill_band(hidden_states.shape[0], forward_batch) else None
+
+    def _hc_combine(self, R, apply_pre, norm, stats_stream=None, quantized=None, normalized=None,
+                    precomputed=None, combined=None):
+        if precomputed is not None:
+            return precomputed[0]
+        if normalized is not None:
+            return normalized
+        if combined is not None:
+            if 4096 <= combined.shape[0] <= 65536:
+                return toy_norm_prefill(combined, norm.weight, norm.variance_epsilon)
+            return norm(combined)
+        if apply_pre is None:
+            return norm(R[:, 0, :].contiguous())
+        p = apply_pre.float()
         if hc_rows(R) >= 4096:          # "fused" reduction order
             y = ((R[:, 0].float() * p[:, 0:1] + R[:, 1].float() * p[:, 1:2])
                  + (R[:, 2].float() * p[:, 2:3] + R[:, 3].float() * p[:, 3:4]))
@@ -258,7 +375,7 @@ class FakeLayer:
             for c in (1, 2, 3):
                 y = y + R[:, c].float() * p[:, c:c + 1]
             y = y.to(BF).float()
-        y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + 1e-6) * self.norm_w
+        y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + 1e-6) * norm.weight.float()
         return y.to(BF)
 
     def _stats(self, R, which):
@@ -269,29 +386,57 @@ class FakeLayer:
         return pre, post, comb
 
     def hc_post(self, x, R, post, comb):
-        out = post.unsqueeze(-1) * x.float().unsqueeze(1) + (comb.unsqueeze(-1) * R.float().unsqueeze(2)).sum(1)
-        return out.to(BF)
+        return toy_post(x, R, post, comb)
+
+    def _hc_post_with_combine(self, x, residual, post, comb, pre, forward_batch, norm=None):
+        if _prefill_band(x.shape[0], forward_batch):
+            if norm is not None:
+                updated, normalized = MPCN.mhc_post_combine_norm_prefill(
+                    x, residual, post, comb, pre, norm.weight, norm.variance_epsilon)
+                return updated, None, normalized
+            updated, combined = toy_post_combine(x, residual, post, comb, pre)
+            return updated, combined, None
+        return self.hc_post(x, residual, post, comb), None, None
 
     def forward_hc_pre_from_prev(self, positions, hidden_states, input_ids, forward_batch,
                                  input_ids_global, prev_pre, precomputed_attn=None,
-                                 next_norm=None, next_input=None):
+                                 next_norm=None, next_input=None, combined_attn=None,
+                                 normalized_attn=None, next_combined=None):
+        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
+        self.stats_stream_seen.append(stats_stream)
         R = hidden_states
-        x = self._hc_combine(R, prev_pre)
-        x = self.self_attn(x=x, positions=positions, forward_batch=forward_batch, x_quant=None)
+        x = self._hc_combine(R, apply_pre=prev_pre, norm=self.input_layernorm,
+                             stats_stream=stats_stream, quantized=None, precomputed=precomputed_attn,
+                             combined=combined_attn, normalized=normalized_attn)
+        attn_mhc = object() if stats_stream is not None else None       # overlap_only fusion
+        ctx = _Fusion.use_mhc_post_fusion(attn_mhc) if attn_mhc is not None else nullcontext()
+        with ctx:
+            x = self.self_attn(x=x, positions=positions, forward_batch=forward_batch, x_quant=None)
         attn_pre, post, comb = self._stats(R, 0)
-        R = self.hc_post(x, R, post, comb)
-        x = self._hc_combine(R, attn_pre)
-        with FORWARD.scoped(mlp_reduce_scatter=False):
+        R, ffn_combined, ffn_normalized = self._hc_post_with_combine(
+            x, R, post, comb, attn_pre, forward_batch, norm=self.post_attention_layernorm)
+        x = self._hc_combine(R, apply_pre=attn_pre, norm=self.post_attention_layernorm,
+                             stats_stream=stats_stream, normalized=ffn_normalized,
+                             combined=ffn_combined)
+        mhc = object() if stats_stream is not None else None
+        ctx = _Fusion.use_mhc_post_fusion(mhc) if mhc is not None else nullcontext()
+        with ctx, FORWARD.scoped(mlp_reduce_scatter=False):
             x = self.mlp(x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global,
                          skip_shared_experts=False)
         ffn_pre, post, comb = self._stats(R, 1)
-        R = self.hc_post(x, R, post, comb)
+        if next_combined is not None:
+            R, combined, normalized = self._hc_post_with_combine(
+                x, R, post, comb, ffn_pre, forward_batch, norm=next_norm)
+            if combined is not None or normalized is not None:
+                next_combined.append((combined, normalized))
+        else:
+            R = self.hc_post(x, R, post, comb)
         return R, ffn_pre
 
 
 class Tail:
     def __init__(self, lens, window=128, pad_rows=0):
-        starts, idx = [], []
+        idx = []
         pos = 0
         for n in lens:
             k = min(window, n)
@@ -358,20 +503,32 @@ def fake_engine(group, backend):
         is_in_breakable_cuda_graph=lambda: False,
         is_cp_active=lambda fb: False,
         get_attn_tp_context=lambda: SimpleNamespace(input_scattered=False),
-        get_tp_group=lambda: group,
+        # v0.5.21: no get_tp_group here; the TP group is get_parallel().tp_group
         get_parallel=lambda: SimpleNamespace(attn_dp_size=1, tp_size=group.world_size,
-                                             attn_tp_size=group.world_size),
+                                             attn_tp_size=group.world_size, tp_group=group),
         get_moe_a2a_backend=lambda: SimpleNamespace(is_none=lambda: True),
-        get_platform=lambda: SimpleNamespace(is_sm100=False),
+        get_platform=lambda: SimpleNamespace(is_sm100=False, is_blackwell=True, is_sm90=False),
         envs=SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=SimpleNamespace(get=lambda: False)),
         MQALayer=FakeAttn,
+        _is_cuda=False,
     )
 
 
 FakeAttn.forward = sp._make_attn_forward(FakeAttn.forward)
 FakeMoE.forward = sp._make_moe_forward(FakeMoE.forward)
 FakeLayer.forward_hc_pre_from_prev = sp._make_layer_forward(FakeLayer.forward_hc_pre_from_prev)
+_STOCK_STREAM = FakeLayer._get_hc_stats_stream
+FakeLayer._get_hc_stats_stream = sp._make_stats_stream(FakeLayer._get_hc_stats_stream)
+FakeLayer._hc_combine = sp._make_hc_combine(FakeLayer._hc_combine)
+FakeLayer.hc_post = sp._make_hc_post(FakeLayer.hc_post)
+FakeLayer._hc_post_with_combine = sp._make_hc_post_with_combine(FakeLayer._hc_post_with_combine)
 sp._REQUIRE_CUDA = False
+
+# the wrappers' GPU-only gates and kernels, as toys (the real ones check is_cuda / Triton)
+sp._post_combine_gate = lambda layer, x, residual, post, comb, pre, fb, m: _prefill_band(m, fb)
+sp._post_norm_ok = lambda norm: norm is not None
+sp.post_combine_rows = toy_post_combine
+sp.norm_prefill_rows = toy_norm_prefill
 
 
 def _agree_min(p, local):
@@ -383,7 +540,7 @@ sp._agree_min = _agree_min
 
 
 # ------------------------------------------------------------------------------------------
-# reference: the engine's stock loop, same fake model
+# reference: the engine's stock loop (v0.5.21 _forward_layers_hc_pre_from_prev), same fake model
 # ------------------------------------------------------------------------------------------
 def stock_forward_layers(self, positions, hidden_states, forward_batch, input_ids, input_ids_global,
                          capture_dspark, aux_out):
@@ -394,8 +551,10 @@ def stock_forward_layers(self, positions, hidden_states, forward_batch, input_id
         tail = backend.tail_forward_metadata.late_layer_tail
     prev_pre = None
     saved = None
+    precomputed_attn = combined_attn = normalized_attn = None
     for i in range(self.start_layer, self.end_layer):
         if tail is not None and i == self.late_layer_start:
+            combined_attn = normalized_attn = None
             saved = backend.enter_late_layer_tail(forward_batch)
             hidden_states, prev_pre, input_ids, input_ids_global = (
                 tail.rows(hidden_states), tail.rows(prev_pre), tail.rows(input_ids),
@@ -404,6 +563,7 @@ def stock_forward_layers(self, positions, hidden_states, forward_batch, input_id
             hash_ids = tail.rows(hash_ids)
         engram = self.layers[i].engram
         if engram is not None:
+            precomputed_attn = combined_attn = normalized_attn = None
             before = hidden_states
             hidden_states = engram(hidden_states, hash_ids[:, engram.layer_hash_index], forward_batch)
             if self.config.vision_n_layers > 0:
@@ -414,30 +574,48 @@ def stock_forward_layers(self, positions, hidden_states, forward_batch, input_id
             if tail is not None and i < self.late_layer_start:
                 aux = tail.rows(aux)
             aux_out.append(aux.mean(dim=1))
+        rows = hidden_states.shape[0]
+        next_norm, next_input = None, []
+        next_combined = (
+            [] if ((128 <= rows <= 384 or _prefill_band(rows, forward_batch))
+                   and i + 1 < self.end_layer and tail is None
+                   and self.layers[i + 1].engram is None) else None)
+        if next_combined is not None and rows >= 4096:
+            next_norm = self.layers[i + 1].input_layernorm
         hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
             positions=positions, hidden_states=hidden_states, input_ids=input_ids,
-            forward_batch=forward_batch, input_ids_global=input_ids_global, prev_pre=prev_pre)
+            forward_batch=forward_batch, input_ids_global=input_ids_global, prev_pre=prev_pre,
+            precomputed_attn=precomputed_attn, next_norm=next_norm, next_input=next_input,
+            combined_attn=combined_attn, normalized_attn=normalized_attn,
+            next_combined=next_combined)
+        precomputed_attn = next_input[0] if next_input else None
+        combined_attn, normalized_attn = next_combined[0] if next_combined else (None, None)
     if saved is not None:
         backend.exit_late_layer_tail(saved, forward_batch)
         return hidden_states, prev_pre, tail
     return hidden_states, prev_pre, None
 
 
-FB = SimpleNamespace(forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True))
+FB = SimpleNamespace(forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True,
+                                                  is_decode=lambda: False,
+                                                  is_target_verify=lambda: False))
 
 
 def run(mode, rows, lens, *, exact=False, late=4, vision=False, rs_order="ring", m_dep=False, seed=1,
-        debug=False):
+        debug=False, keep_pcn=False):
     """Every rank's (hidden, pre, aux list) for one forward in `mode` (stock | comm | shard)."""
     group = ThreadGroup(W, rs_order)
     model = FakeModel(group, seed, late=late, vision=vision, m_dependent_wkv=m_dep)
     tail = Tail(lens) if late is not None else None
     backend = Backend(tail)
     sp._M.clear()
-    sp._M.update(v4=fake_engine(group, backend), v2=SimpleNamespace(DeepseekV2MoE=FakeMoE))
+    sp._M.update(v4=fake_engine(group, backend), v2=SimpleNamespace(DeepseekV2MoE=FakeMoE),
+                 engram=SimpleNamespace(engram_gate=fake_engram_gate), mpcn=MPCN, mpf=_Fusion)
     sp._STATIC["checked"] = False
     sp._STATIC["tail_checked"] = True         # the engine's tail helpers are hash-checked on GPU
     sp._WKV_OK.clear()
+    if not keep_pcn:
+        sp._PCN_OK.clear()
     g = torch.Generator().manual_seed(seed + 100)
     R0 = torch.randn(rows, 4, D, generator=g).to(BF)
     ids = torch.randint(0, 40, (rows,), generator=g)
@@ -520,6 +698,8 @@ def main():
         cases = [
             ("one request", 4096, [4096], dict()),
             ("straddling requests", 4096, [1000, 50, 2046, 1000], dict()),
+            ("8192, cross-layer", 8192, [8192], dict(late=None)),
+            ("16384, shard in band", 16384, [16384], dict()),
             ("odd shards + vision", 2052, [513, 1, 1025, 513], dict(vision=True)),
             ("tail == all rows", 2048, [64] * 32, dict()),
             ("no bounded replay", 4096, [4096], dict(late=None)),
@@ -527,8 +707,9 @@ def main():
             ("below MIN_ROWS (stock)", 1020, [1020], dict()),
         ]
         for name, rows, lens, kw in cases:
-            stock, _, _ = run("stock", rows, lens, **kw)
+            stock, m_st, _ = run("stock", rows, lens, **kw)
             exact, m_ex, g_ex = run("shard", rows, lens, exact=True, **kw)
+            pcn = dict(sp._PCN_OK)
             fast, m_fast, g_fast = run("shard", rows, lens, **kw)
             comm, _, g_comm = run("comm", rows, lens, **kw)
             comm_same, _, _ = run("comm", rows, lens, rs_order="same", **kw)
@@ -537,15 +718,21 @@ def main():
                 assert same(exact[r], stock[r]), (name, "exact != stock", r)
                 assert same(fast[r], comm[r]), (name, "fast != P0", r)
                 assert same(comm_same[r], stock[r]), (name, "P0 with a same-order RS != stock", r)
+            band = 4096 <= rows <= 65536
+            if band:                # stock took the stats stream on every full-row layer
+                assert "side-stream" in m_st.layers[0].stats_stream_seen, name
             if planned:
                 assert not same(fast[0], stock[0]), (name, "the RS order should show")
                 attn = m_fast.layers[0].self_attn
                 assert set(attn.seen_rows) == {rows}, (name, attn.seen_rows)
+                # never a stats stream inside the region (any mode)
+                assert set(m_fast.layers[0].stats_stream_seen) == {None}, name
                 late = kw.get("late", 4)
                 tail_ars = 0 if late is None else 2 * (len(m_fast.layers) - late)   # stock late layers
                 assert g_fast.calls["ar"] == tail_ars == g_comm.calls["ar"], (name, g_fast.calls)
                 eng_shard = m_fast.layers[1].engram.wkv_calls
                 assert rows // W in eng_shard, (name, eng_shard)
+                assert pcn == ({rows: True} if band else {}), (name, pcn)
             else:
                 assert same(fast[0], stock[0]) and same(comm[0], stock[0]), name
             print(f"  {name:24s} rows={rows}: exact==stock, fast==P0"
@@ -560,6 +747,53 @@ def main():
         stock, _, _ = run("stock", 4096, [4096])
         assert not same(wrong[0], stock[0]), "a shard-keyed gate should change the result"
 
+        # the post+combine+norm decision keyed on the shard (no wrapper): bits change
+        wrapped = FakeLayer._hc_post_with_combine
+        FakeLayer._hc_post_with_combine = wrapped.__wrapped__
+        try:
+            wrong, _, _ = run("shard", 4096, [4096], exact=True)
+        finally:
+            FakeLayer._hc_post_with_combine = wrapped
+        assert not same(wrong[0], stock[0]), "a shard-keyed post+combine gate should change the result"
+
+        # without the stats-stream and fusion guards the attention would reduce twice. The hazard
+        # needs >= 4096 rows inside the region: P0 at M = 4096, stage 1 at M = 16384 (shard 4096).
+        def guarded(which):
+            """{mode: equal to stock on every rank} with only `which` guards in place."""
+            guard, no_mhc = FakeLayer._get_hc_stats_stream, sp._no_mhc_fusion
+            if "stream" not in which:
+                FakeLayer._get_hc_stats_stream = _STOCK_STREAM
+            if "fusion" not in which:
+                sp._no_mhc_fusion = nullcontext
+            try:
+                res = {}
+                for mode, rows, kw in (("comm", 4096, dict(rs_order="same")),
+                                       ("shard", 16384, dict(exact=True))):
+                    ref, _, _ = run("stock", rows, [rows])
+                    got, _, _ = run(mode, rows, [rows], **kw)
+                    res[mode] = all(same(got[r], ref[r]) for r in range(W))
+                return res
+            finally:
+                FakeLayer._get_hc_stats_stream, sp._no_mhc_fusion = guard, no_mhc
+
+        assert guarded(()) == {"comm": False, "shard": False}, "a double all-reduce should show"
+        for which in (("stream",), ("fusion",), ("stream", "fusion")):
+            assert guarded(which) == {"comm": True, "shard": True}, which
+
+        # fused kernel != the shard pair: this chunk exact via gathers, later ones stock
+        MPCN.mhc_post_combine_norm_prefill = _fused_bad
+        try:
+            stock_bad, _, _ = run("stock", 4096, [1000, 3096])
+            exact, _, _ = run("shard", 4096, [1000, 3096], exact=True)
+            assert all(same(exact[r], stock_bad[r]) for r in range(W)), "post+combine fallback not exact"
+            assert exact[0][3] is not None and sp._PCN_OK == {4096: False}, sp._PCN_OK
+            again, _, _ = run("shard", 4096, [1000, 3096], exact=True, keep_pcn=True)
+            assert again[0][3] is None, "a failed size must run stock afterwards"
+            assert all(same(again[r], stock_bad[r]) for r in range(W))
+        finally:
+            MPCN.mhc_post_combine_norm_prefill = _fused_ok
+            sp._PCN_OK.clear()
+
         # wkv whose result depends on M: the self-check must fall back and stay exact
         stock, _, _ = run("stock", 4096, [1000, 3096], m_dep=True)
         exact, m_ex, _ = run("shard", 4096, [1000, 3096], exact=True, m_dep=True)
@@ -569,28 +803,32 @@ def main():
         exact, _, _ = run("shard", 4096, [1000, 3096], exact=True)
         assert all(same(exact[r], stock[r]) for r in range(W))
         assert sp._WKV_OK and all(sp._WKV_OK.values()), sp._WKV_OK
+
+        # debug compare + fingerprints: on (exact and fast), results unchanged, nothing flagged
+        old_dbg = set(sp.DEBUG)
+        sp.DEBUG.clear()
+        sp.DEBUG.update({"compare", "fp"})
+        try:
+            for rows, lens, kw in ((4096, [1000, 50, 2046, 1000], dict()),
+                                   (2052, [513, 1, 1025, 513], dict()),
+                                   (4096, [4096], dict(late=None))):
+                stock, _, _ = run("stock", rows, lens, **kw)
+                for exact_ in (True, False):
+                    dbg, _, _ = run("shard", rows, lens, exact=exact_, debug=True, **kw)
+                    ref, _, _ = run("shard", rows, lens, exact=exact_, **kw)
+                    for r in range(W):
+                        d = dbg[r][3][1]
+                        assert same(dbg[r][:3] + (None,), ref[r][:3] + (None,)), "debug changed the result"
+                        assert d.checked >= 10 and not d.bad, (rows, d.checked, d.bad)
+                        assert {k for _, k, _ in d.fps} == {"Rin", "ain", "aout", "min", "mout", "Rout", "pre"}
+                        assert {layer for layer, _, _ in d.fps} == set(range(6)), d.fps[:3]
+                    if exact_:
+                        assert all(same(dbg[r][:3] + (None,), stock[r]) for r in range(W))
+        finally:
+            sp.DEBUG.clear()
+            sp.DEBUG.update(old_dbg)
     finally:
         sp.MIN_ROWS = MIN
-    # debug compare + fingerprints: on (exact and fast), results unchanged, nothing flagged
-    old_dbg = set(sp.DEBUG)
-    sp.DEBUG.clear()
-    sp.DEBUG.update({"compare", "fp"})
-    try:
-        stock, _, _ = run("stock", 4096, [1000, 50, 2046, 1000])
-        for exact_ in (True, False):
-            dbg, _, _ = run("shard", 4096, [1000, 50, 2046, 1000], exact=exact_, debug=True)
-            ref, _, _ = run("shard", 4096, [1000, 50, 2046, 1000], exact=exact_)
-            for r in range(W):
-                d = dbg[r][3][1]
-                assert same(dbg[r][:3] + (None,), ref[r][:3] + (None,)), "debug changed the result"
-                assert d.checked >= 10 and not d.bad, (d.checked, d.bad)
-                assert {k for _, k, _ in d.fps} == {"Rin", "ain", "aout", "min", "mout", "Rout", "pre"}
-                assert {layer for layer, _, _ in d.fps} == set(range(6)), d.fps[:3]
-            if exact_:
-                assert all(same(dbg[r][:3] + (None,), stock[r]) for r in range(W))
-    finally:
-        sp.DEBUG.clear()
-        sp.DEBUG.update(old_dbg)
     print("test_prefill_sp: ok")
 
 
