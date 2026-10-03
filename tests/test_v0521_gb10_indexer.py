@@ -15,6 +15,7 @@ import ast
 import importlib.util
 import sys
 import types
+import typing
 
 import torch
 import torch.nn.functional as F
@@ -109,7 +110,7 @@ def flat_tiles(*, q, kv, weights, starts, lengths, context_lengths, budget_bytes
 src = open(CB).read()
 tree = ast.parse(src)
 fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("select_candidate_block_ids", "topk_among_blocks")]
-ns = {"torch": torch, "F": F, "Union": object, "Optional": object}
+ns = {"torch": torch, "F": F, "Union": typing.Union, "Optional": typing.Optional}  # Python 3.12 evaluates annotations at def time
 exec(compile(ast.Module(body=fns, type_ignores=[]), CB, "exec"), ns)
 
 mod("sglang.kernels.ops.attention.dsv4", topk_transform_ragged_v2=ragged_topk)
