@@ -1,19 +1,19 @@
 # TP4 production image (.env.tp4.example, docs/tp4.md). Same pinned base image as Dockerfile, but
-# the SGLang python tree replaced by the upstream dsv4.1 branch at f80c91a4b (2026-09-16 19:45 UTC;
-# carries #39370 mHC/metadata fusion, #39653 communication kernels, #39648 top-k, #39646 kernels)
+# the SGLang python tree replaced by the upstream v0.5.21 release (e00930c5, 2026-10-02; base
+# lmsysorg/sglang:v0.5.21, which already carries the dsv4.1 branch work)
 # with the kernel packages the branch pins (sglang-kernel 0.4.7, sgl-deep-gemm 0.2.0; aarch64
 # wheels from PyPI), rhys101's SG17 RoCEnante overlay adapted to TP4, the SG17 b12x (RoCEnante)
 # plus sparkring's roce_ring, b12x main as b12x_next (routed MoE at EP_SIZE=1), and all adapters.
 # The SM120 page-split override (runtime/flash_mla_sm120.py) is re-applied on top of the branch's
 # kernel file. Third-party trees are fetched at build, at the commits and sha256 in
 # runtime/sources.manifest (scripts/fetch_runtime.sh), and patched with the files in this repo.
-# Tag: dsv41-4x-spark:canary-roce
-FROM lmsysorg/sglang:dev-dsv41@sha256:3dbc313030a6ef2c5d7de8ecf48e9aece722694a82182cb618cc82b588816349 AS fetch
+# Tag: dsv41-4x-spark:sglang-0.5.21 (trial; the v3 indexer test is dropped because DSV41_INDEXER_CHUNKED is off)
+FROM lmsysorg/sglang:v0.5.21@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469 AS fetch
 COPY runtime/sources.manifest runtime/sglang-rocenante.patch runtime/flash_mla_sm120.canary.py /src/runtime/
 COPY scripts/fetch_runtime.sh scripts/b12x_next-compact-n64-m64.patch scripts/roce_ring-sparkring-f16b5f4.patch /src/scripts/
 RUN bash /src/scripts/fetch_runtime.sh /fetched sglang-canary b12x b12x-next
 
-FROM lmsysorg/sglang:dev-dsv41@sha256:3dbc313030a6ef2c5d7de8ecf48e9aece722694a82182cb618cc82b588816349
+FROM lmsysorg/sglang:v0.5.21@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
 # Same mirror knob as Dockerfile.canary (Saolence, #6): --build-arg PIP_INDEX=<mirror>/simple
 ARG PIP_INDEX=https://pypi.org/simple
 RUN pip install --no-deps --no-cache-dir -i "$PIP_INDEX" "sglang-kernel==0.4.7" "sgl-deep-gemm==0.2.0"
@@ -57,8 +57,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.p
  && PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_autotune_keep.py \
  && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_replicated_split.py \
  && CUDA_VISIBLE_DEVICES= VC_TEST_N=60000 PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_verify_cap.py \
- && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_roce_ring.py \
- && cd /opt/dsv41/tests && CUDA_VISIBLE_DEVICES= PYTHONPATH=/opt/dsv41/adapter python3 test_indexer_chunked_v3.py /sgl-workspace/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+ && CUDA_VISIBLE_DEVICES= python3 /opt/dsv41/tests/test_roce_ring.py
 ENV PYTHONPATH=/opt/dsv41/adapter:/opt/b12x:/opt/b12x_next \
     MODEL_PATH=/models/DeepSeek-V4.1-Flash \
     STATE_PATH=/state OFFLOAD_MODE=nvme DSV41_CACHE_GIB=16

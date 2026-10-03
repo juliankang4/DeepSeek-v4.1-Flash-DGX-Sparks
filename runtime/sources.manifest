@@ -10,8 +10,8 @@
 # (the url always names the same commit; the script checks that). `local` rows at the end
 # list files kept in this repository: local  path  sha256  -
 
-# SGLang dsv4.1 branch, python/ tree only (2026-09-16 19:45 UTC). Apache-2.0.
-sglang-canary  f80c91a4b97e52e17fbcff088aa6b47b6270f6b9  9968fcff7fa8218b8246a4553d72933b08f4846550e7c5b6a891bdc3bdc881a8  https://github.com/sgl-project/sglang/archive/f80c91a4b97e52e17fbcff088aa6b47b6270f6b9.tar.gz
+# SGLang v0.5.21 release (e00930c5, 2026-10-02), python/ tree only. Apache-2.0.
+sglang-canary  e00930c5489053f26d86b179cee0d087f846acbb  c87172533bed21e378fa6f90e7871758581c302fab991af2fd8ca773584e9c9e  https://github.com/sgl-project/sglang/archive/e00930c5489053f26d86b179cee0d087f846acbb.tar.gz
 
 # b12x as frozen for rhys101's SG17 RoCEnante overlay (b12x.comm.roce); published as a source
 # archive in rhys101/DeepSeek-V4.1-Flash-vLLM-DGX-Spark-8, provenance in
