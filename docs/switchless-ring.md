@@ -577,9 +577,10 @@ the two before it (the fast loader's boot-to-boot spread).
    python3 scripts/ring_mesh/plan.py --sparkring ~/sparkring --out ring-mesh spark1 spark2 spark3 spark4
    ```
 
-   It inventories the nodes over SSH, reads the cabling from the fabric subnets, numbers the ring the
-   way sparkring's planner needs it (every f0 port cabled to the next node's f1; it refuses anything
-   else), and has sparkring's planner build the RoCEnante selection: per node two `/32` routes, two
+   It inventories the nodes over SSH, orients the ring from the head's f0 ports, and resolves each
+   other node's ports by subnet. Same-number port connections are supported; cross-PCIe-domain
+   cables, duplicate neighbors, and different cycle orders between domains are rejected.
+   Sparkring's planner then builds the RoCEnante selection: per node two `/32` routes, two
    tc rules and two markers. It writes `mesh-up-<host>.sh` / `mesh-down-<host>.sh` and `env.txt`,
    the `EXTRA_CONTAINER_ENV` additions with the per-rank peer maps already translated to the TP rank
    order (sparkring numbers the ring by cabling direction, which need not match it).

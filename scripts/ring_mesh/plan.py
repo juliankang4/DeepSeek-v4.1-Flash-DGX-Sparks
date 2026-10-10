@@ -5,8 +5,8 @@
 
 HEAD W1 W2 W3 are SSH names of the four Sparks in tensor-parallel rank order (the head, then
 WORKER_HOSTS). Each is inventoried over SSH with inventory.sh; the cabling is read from the
-fabric subnets (each DAC is its own /24), the ring is numbered the way sparkring's planner
-requires (physical port f0 clockwise), and FujitsuPolycom/sparkring's own planner
+fabric subnets (each DAC is its own subnet), the ring is oriented from the head's f0 port,
+and each node's actual ports are assigned to that orientation. FujitsuPolycom/sparkring's planner
 (spark_transport/fabric/cx7_hairpin_diagonal/fabric.py, tested at f16b5f4) builds the RoCEnante
 selection: per rank two /32 routes to the opposite node via a neighbour, two hardware-only tc
 redirect rules for the traffic it forwards, and two source markers. Writes into --out:
@@ -28,8 +28,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# sparkring's source-bound map: physical port f0 is the clockwise direction, function 0 is the
-# first PCIe domain (rocep1s0f*) and function 1 the second (roceP2p1s0f*).
+# The head defines clockwise with f0. Function 0 and 1 are the two PCIe domains.
 PORTS = {
     ("clockwise", 0): "enp1s0f0np0",
     ("clockwise", 1): "enP2p1s0f0np0",
@@ -69,32 +68,46 @@ def _gid_tail(cidr):
     return f"{int(a):02x}{int(b):02x}:{int(c):02x}{int(d):02x}"
 
 
-def ring_order(invs, hosts):
-    """Hosts in sparkring ring order, starting at the TP rank 0 host: each f0 port reaches the next host's f1."""
+def fabric_peers(invs, hosts):
+    """Resolve physical peers by subnet, preserving the PCIe domain of each cable."""
     net = {}
     for h in hosts:
+        if set(invs[h]["ports"]) != set(PORTS.values()):
+            raise SystemExit(f"{h}: expected exactly four fabric ports")
         for nd, p in invs[h]["ports"].items():
             net.setdefault(ipaddress.ip_interface(p["ipv4"]).network, []).append((h, nd))
     peer = {}
+    domain = {nd: f for (_direction, f), nd in PORTS.items()}
     for ends in net.values():
         if len(ends) != 2:
-            raise SystemExit(f"fabric subnet shared by {len(ends)} ports, expected one DAC per /24: {ends}")
+            raise SystemExit(f"fabric subnet shared by {len(ends)} ports, expected one DAC: {ends}")
         (h1, n1), (h2, n2) = ends
+        if h1 == h2 or domain[n1] != domain[n2]:
+            raise SystemExit(f"invalid loop or cross-domain cable: {ends}")
         peer[(h1, n1)], peer[(h2, n2)] = (h2, n2), (h1, n1)
+    return peer
+
+
+def ring_order(invs, hosts):
+    """Orient the cycle from rank 0's f0 port; other nodes may have flipped ports."""
+    peer = fabric_peers(invs, hosts)
     order = [hosts[0]]
+    previous = None
     while True:
         cur = order[-1]
         nxt = []
         for f in (0, 1):
-            h, nd = peer.get((cur, PORTS[("clockwise", f)]), (None, None))
-            if nd != PORTS[("counter_clockwise", f)]:
-                raise SystemExit(f"{cur} {PORTS[('clockwise', f)]} reaches {h} {nd}; sparkring needs every f0 port "
-                                 f"cabled to the next node's f1 port on the same PCIe domain")
-            nxt.append(h)
+            neighbors = [peer[(cur, PORTS[(d, f)])][0] for d in ("clockwise", "counter_clockwise")]
+            if len(set(neighbors)) != 2 or (previous is not None and previous not in neighbors):
+                raise SystemExit(f"{cur}: invalid neighbors on domain {f}: {neighbors}")
+            nxt.append(neighbors[0] if previous is None else next(h for h in neighbors if h != previous))
         if nxt[0] != nxt[1]:
-            raise SystemExit(f"{cur}: its two f0 functions reach different nodes {nxt}")
+            raise SystemExit(f"{cur}: the two PCIe domains have different cycle order {nxt}")
         if nxt[0] == hosts[0]:
             break
+        if nxt[0] in order:
+            raise SystemExit(f"cycle repeats before reaching rank 0: {order} -> {nxt[0]}")
+        previous = cur
         order.append(nxt[0])
     if sorted(order) != sorted(hosts) or len(order) != 4:
         raise SystemExit(f"not a four-node ring: {order}")
@@ -102,13 +115,19 @@ def ring_order(invs, hosts):
 
 
 def topology(invs, order, state_root="/run/dsv41-mesh"):
+    peer = fabric_peers(invs, order)
     ranks = []
     for r, h in enumerate(order):
         ports = {}
         for d in ("clockwise", "counter_clockwise"):
             ports[d] = []
             for f in (0, 1):
-                nd = PORTS[(d, f)]
+                neighbor = order[(r + (1 if d == "clockwise" else -1)) % 4]
+                candidates = [nd for (direction, domain), nd in PORTS.items()
+                              if domain == f and peer[(h, nd)][0] == neighbor]
+                if len(candidates) != 1:
+                    raise SystemExit(f"{h}: no unique domain-{f} port toward {neighbor}")
+                nd = candidates[0]
                 p = invs[h]["ports"][nd]
                 ports[d].append({
                     "function": f, "netdev": nd, "rdma_device": p["rdma"],

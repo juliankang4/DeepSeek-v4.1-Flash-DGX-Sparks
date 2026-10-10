@@ -3,12 +3,11 @@
 
 - B12X_ROCE_PEER_HCA_MAPS: one ';'-separated map per rank is picked by rank, B12X_ROCE_PEER_HCA_MAP
   still wins, a wrong count refuses.
-- plan.py orients the ring from the fabric subnets (sparkring numbers it with physical port f0
-  clockwise), refuses a cable that breaks that contract, and translates sparkring's per-rank
+- plan.py orients the ring from the fabric subnets (the head's physical port f0 is clockwise),
+  accepts flipped ports within a PCIe domain, and translates sparkring's per-rank
   paths into peer maps for the TP rank order. The fixtures are a real four-Spark ring whose TP
   order runs the other way round the cables (TP 0,1,2,3 = ring 0,3,2,1).
-- every map pairs path i at both ends on the same PCIe domain, and a neighbour's paths cross the
-  cable (f0 at one end, f1 at the other).
+- every map pairs path i at both ends on the same PCIe domain.
 - in the image: the RoCEnante overlay selects the package from DSV41_ROCE_RING.
 
 No GPU, torch or network. usage: python3 tests/test_roce_ring.py
@@ -92,11 +91,34 @@ class Plan(unittest.TestCase):
     def test_ring_order(self):
         self.assertEqual(plan.ring_order(inventory(ADDR), HOSTS), ["s1", "s4", "s3", "s2"])
 
-    def test_miscabled_refuses(self):
+    def test_flipped_node_preserves_cycle(self):
         bad = {h: dict(p) for h, p in ADDR.items()}
-        bad["s2"]["enp1s0f0np0"], bad["s2"]["enp1s0f1np1"] = bad["s2"]["enp1s0f1np1"], bad["s2"]["enp1s0f0np0"]
+        for prefix in ("enp1", "enP2p1"):
+            a, b = prefix + "s0f0np0", prefix + "s0f1np1"
+            bad["s2"][a], bad["s2"][b] = bad["s2"][b], bad["s2"][a]
+        self.assertEqual(plan.ring_order(inventory(bad), HOSTS), ["s1", "s4", "s3", "s2"])
+
+    def test_cross_domain_cable_refuses(self):
+        bad = {h: dict(p) for h, p in ADDR.items()}
+        a, b = "enp1s0f0np0", "enP2p1s0f0np0"
+        bad["s2"][a], bad["s2"][b] = bad["s2"][b], bad["s2"][a]
         with self.assertRaises(SystemExit):
             plan.ring_order(inventory(bad), HOSTS)
+
+    def test_flipped_topology_uses_actual_devices(self):
+        addr = {h: dict(p) for h, p in ADDR.items()}
+        for prefix in ("enp1", "enP2p1"):
+            a, b = prefix + "s0f0np0", prefix + "s0f1np1"
+            addr["s2"][a], addr["s2"][b] = addr["s2"][b], addr["s2"][a]
+        inv = inventory(addr)
+        for h, value in inv.items():
+            for nd, p in value["ports"].items():
+                p.update(rdma=nd.replace("en", "roce").replace("np0", "").replace("np1", ""), mac="00:00:00:00:00:01")
+        order = plan.ring_order(inv, HOSTS)
+        t = plan.topology(inv, order)
+        rank = next(r for r in t["ranks"] if r["ssh_alias"] == "s2")
+        self.assertEqual(rank["ports"]["clockwise"][0]["netdev"], "enp1s0f1np1")
+        self.assertEqual(rank["ports"]["clockwise"][1]["rdma_device"], "roceP2p1s0f1")
 
     def test_peer_maps(self):
         order = plan.ring_order(inventory(ADDR), HOSTS)
