@@ -560,8 +560,9 @@ the two before it (the fast loader's boot-to-boot spread).
    `hairpin_num_queues` 4, `flow_steering_mode` `hmfs`, eswitch `legacy`, `hw-tc-offload on` on all
    four fabric netdevs (sparkring's
    [driver configuration notes](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_SPARK_MTP3_MESH_QUICKSTART.md#connectx-7-driver-configuration-for-hardware-forwarding)).
-   `scripts/ring_mesh/inventory.sh` prints all of it per node; `plan.py` refuses a node whose links,
-   MTU, GID, TC offload or steering mode do not match.
+   `scripts/ring_mesh/inventory.sh` prints all of it per node, with each port's NetworkManager
+   connection; `plan.py` refuses a node whose links, MTU, GID, TC offload or steering mode do not
+   match, or whose port has no active connection.
 2. **The source marker**, built on every node from a sparkring checkout at `f16b5f4`
    (source sha256 `8684a696…`; it built to `2828c07e…` here, the binary sparkring records):
 
@@ -581,9 +582,11 @@ the two before it (the fast loader's boot-to-boot spread).
    other node's ports by subnet. Same-number port connections are supported; cross-PCIe-domain
    cables, duplicate neighbors, and different cycle orders between domains are rejected.
    Sparkring's planner then builds the RoCEnante selection: per node two `/32` routes, two
-   tc rules and two markers. It writes `mesh-up-<host>.sh` / `mesh-down-<host>.sh` and `env.txt`,
-   the `EXTRA_CONTAINER_ENV` additions with the per-rank peer maps already translated to the TP rank
-   order (sparkring numbers the ring by cabling direction, which need not match it).
+   tc rules and two markers. Each route also goes into its port's NetworkManager profile: after a
+   carrier loss NetworkManager restores only what the profile holds. It writes
+   `mesh-up-<host>.sh` / `mesh-down-<host>.sh` and `env.txt`, the `EXTRA_CONTAINER_ENV` additions
+   with the per-rank peer maps already translated to the TP rank order (sparkring numbers the ring
+   by cabling direction, which need not match it).
 4. **Install on every node** with the engine stopped (applying the hairpin size re-initialises each
    fabric function); `$HOST` is that node's name as given to `plan.py`:
 
