@@ -4,13 +4,18 @@
 Loads the checkpoint's reference encoder (the only prompt-format spec DeepSeek
 ships) and checks thinking-off, tools, and reasoning-effort renders. When SGLang
 is importable (in the serving image), also diffs encoding_dsv41.encode_messages
-after the publisher effort remap.
+(prompt and image order) after the publisher effort remap and the 1017 rules
+(adapter/encoding_1017.py), runs the checkpoint's golden fixtures
+(encoding/tests/test_input_N.json -> test_output_N.txt) through it, and checks
+that SGLang-only renders (developer role) did not change. --stock skips the
+1017 rules to show what they change.
 
     python3 tests/test_chat_encoding.py
     python3 tests/test_chat_encoding.py --src ~/NewModels/DeepSeek-V4.1-Flash
 """
 import argparse
 import difflib
+import glob
 import importlib.util
 import json
 import os
@@ -21,9 +26,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'adapter'))
 
 from encoding_compat import PUBLISHER_REASONING_EFFORT, install_encoder  # noqa: E402
+from encoding_1017 import install as install_1017  # noqa: E402
 
 DEFAULT_SRC = os.environ.get(
     'MODEL_PATH', os.path.expanduser('~/NewModels/DeepSeek-V4.1-Flash'))
+
+
+def call(cid, name, arguments, **extra):
+    return {'type': 'function', 'id': cid, **extra,
+            'function': {'name': name, 'arguments': arguments}}
+
+
+def text_image(text, url):
+    return [{'type': 'text', 'text': text}, {'type': 'image_url', 'image_url': {'url': url}}]
+
+
+AGENT_LOOP = [{'role': 'user', 'content': 'q1'},
+              {'role': 'assistant', 'content': 'a1', 'reasoning_content': 'r1'},
+              {'role': 'user', 'content': 'q2'},
+              {'role': 'assistant', 'content': '', 'reasoning_content': 'r2',
+               'tool_calls': [call('c1', 'lookup', '{"q": "x"}')]},
+              {'role': 'tool', 'tool_call_id': 'c1', 'content': 'v1'},
+              {'role': 'assistant', 'content': '', 'reasoning_content': 'r3',
+               'tool_calls': [call('c2', 'lookup', {'q': 'y'})]},
+              {'role': 'tool', 'tool_call_id': 'c2', 'content': 'v2'}]
 
 CASES = [
     ('plain user, thinking',
@@ -114,6 +140,64 @@ CASES = [
                            'schema': {'type': 'object',
                                       'properties': {'a': {'type': 'string'}}}},
           thinking_mode='thinking')),
+    # 1017 rules (adapter/encoding_1017.py)
+    ('agent loop without tools keeps reasoning across tool results',
+     dict(messages=AGENT_LOOP, thinking_mode='thinking')),
+    ('new user turn after tool results drops their reasoning',
+     dict(messages=AGENT_LOOP + [{'role': 'user', 'content': 'q3'}], thinking_mode='thinking')),
+    ('tool result and user text form one turn',
+     dict(messages=AGENT_LOOP[:5] + [{'role': 'user', 'content': 'and now?'}],
+          thinking_mode='thinking')),
+    ('namespaced tools and calls',
+     dict(messages=[{'role': 'system', 'content': 'sys'},
+                    {'role': 'user', 'content': 'find it'},
+                    {'role': 'assistant', 'content': '', 'reasoning_content': 'both',
+                     'tool_calls': [call('a', 'read', {'path': 'x'}, namespace='files'),
+                                    call('b', 'search::read', {'q': 'x'})]},
+                    {'role': 'tool', 'tool_call_id': 'a', 'content': 'file'},
+                    {'role': 'tool', 'tool_call_id': 'b', 'content': 'hit'}],
+          tools=[{'type': 'function',
+                  'namespace': {'name': 'files', 'description': 'File tools.'},
+                  'function': {'name': 'read', 'description': 'Read a file',
+                               'parameters': {'type': 'object'}}},
+                 {'type': 'function', 'function': {'name': 'read', 'namespace': 'search',
+                                                   'parameters': {'type': 'object'}}},
+                 {'type': 'function', 'function': {'name': 'read',
+                                                   'parameters': {'type': 'object'}}}],
+          thinking_mode='thinking')),
+    ('tool call arguments null or double-encoded',
+     dict(messages=[{'role': 'user', 'content': 'go'},
+                    {'role': 'assistant', 'content': '', 'tool_calls': [
+                        call('a', 'w', None), call('b', 'w', json.dumps(json.dumps({'c': 'P'})))]},
+                    {'role': 'tool', 'tool_call_id': 'a', 'content': 'x'},
+                    {'role': 'tool', 'tool_call_id': 'b', 'content': 'y'}],
+          thinking_mode='chat')),
+    ('tool content list with a video part',
+     dict(messages=[{'role': 'user', 'content': 'clip?'},
+                    {'role': 'assistant', 'content': '', 'tool_calls': [call('a', 'clip', {})]},
+                    {'role': 'tool', 'tool_call_id': 'a', 'content': [
+                        {'type': 'text', 'text': 'clip:'},
+                        {'type': 'video_url', 'video_url': {'url': 'v.mp4'}}]}],
+          thinking_mode='chat')),
+    ('out-of-order tool results carrying images',
+     dict(messages=[{'role': 'user', 'content': text_image('look', 'history.png')},
+                    {'role': 'assistant', 'content': '', 'tool_calls': [
+                        call('a', 'snap', {'n': 1}), call('b', 'snap', {'n': 2})]},
+                    {'role': 'tool', 'tool_call_id': 'b', 'content': text_image('b', 'b.png')},
+                    {'role': 'tool', 'tool_call_id': 'a', 'content': text_image('a', 'a.png')}],
+          thinking_mode='thinking')),
+]
+
+# SGLang-only renders (the reference has no developer role): must equal the stock encoder's.
+STOCK_CASES = [
+    ('developer role with tools, thinking',
+     dict(messages=[{'role': 'developer', 'content': 'Use tools.'},
+                    {'role': 'user', 'content': 'Weather?'}],
+          tools=[{'type': 'function', 'function': {'name': 'w', 'parameters': {'type': 'object'}}}],
+          thinking_mode='thinking')),
+    ('developer after tool results, thinking',
+     dict(messages=AGENT_LOOP[2:5] + [{'role': 'developer', 'content': 'Be brief.'}],
+          thinking_mode='thinking')),
 ]
 
 
@@ -134,35 +218,39 @@ def prepare_messages(case):
     return msgs
 
 
-def reference_render(enc, case):
-    kwargs = {}
-    if 'reasoning_effort' in case:
-        kwargs['reasoning_effort'] = case['reasoning_effort']
-    return enc.encode_messages(
+def render(enc, case):
+    """(prompt, image urls in prompt order) from either encoder."""
+    kwargs = {k: case[k] for k in ('reasoning_effort', 'context') if case.get(k) is not None}
+    prompt, media = enc.encode_messages(
         prepare_messages(case),
         thinking_mode=case['thinking_mode'],
+        return_multi_modal_data=True,
         **kwargs,
     )
+    return prompt, [image.get('url') for image in media['images']]
 
 
-def try_sglang_encoder():
+def golden_cases(enc, src):
+    """The checkpoint's encoding/tests fixtures as (name, case, expected prompt)."""
+    for path in sorted(glob.glob(os.path.join(src, 'encoding', 'tests', 'test_input_*.json'))):
+        case = enc.load_cases(path)[0]
+        case['thinking_mode'] = case['thinking_mode'] or 'chat'
+        with open(path.replace('test_input_', 'test_output_')[:-len('.json')] + '.txt') as f:
+            expected = f.read()
+        yield f'golden {os.path.basename(path)}', case, expected
+
+
+def try_sglang_encoder(stock):
+    """encoding_dsv41 with the adapters installed, plus its stock STOCK_CASES renders."""
     try:
         from sglang.srt.entrypoints.openai import encoding_dsv41
     except ImportError:
-        return None
+        return None, None
+    stock_renders = {name: render(encoding_dsv41, case) for name, case in STOCK_CASES}
     install_encoder(encoding_dsv41)
-    return encoding_dsv41
-
-
-def sglang_render(enc, case):
-    kwargs = {}
-    if 'reasoning_effort' in case:
-        kwargs['reasoning_effort'] = case['reasoning_effort']
-    return enc.encode_messages(
-        prepare_messages(case),
-        thinking_mode=case['thinking_mode'],
-        **kwargs,
-    )
+    if not stock and not install_1017(encoding_dsv41):
+        raise SystemExit('encoding_1017 did not install: encoding_dsv41 drifted')
+    return encoding_dsv41, stock_renders
 
 
 def check_reference_shape(name, case, prompt, enc):
@@ -207,6 +295,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--src', default=DEFAULT_SRC)
     ap.add_argument('-v', '--verbose', action='store_true')
+    ap.add_argument('--stock', action='store_true', help='compare without the 1017 rules')
     args = ap.parse_args()
 
     enc_path = os.path.join(args.src, 'encoding', 'encoding.py')
@@ -221,29 +310,46 @@ def main():
     assert PUBLISHER_REASONING_EFFORT['low'] == 50
     assert PUBLISHER_REASONING_EFFORT['high'] == 75
 
-    sgl = try_sglang_encoder()
+    sgl, stock_renders = try_sglang_encoder(args.stock)
     if sgl is None:
         print('sglang encoding_dsv41 not importable; reference-shape checks only')
     else:
         print('comparing sglang encoding_dsv41 to publisher encoding.py '
-              f'(effort map {dict(sgl.REASONING_EFFORT_MAPPINGS)})')
+              f'(effort map {dict(sgl.REASONING_EFFORT_MAPPINGS)}, '
+              f'1017 rules {"off" if args.stock else "on"})')
+
+    rows = [(name, case, None) for name, case in CASES]
+    rows += list(golden_cases(ref, args.src))
+    if sgl is not None:
+        rows += [(name, case, stock_renders[name]) for name, case in STOCK_CASES]
+
+    def diff(want, got, a, b):
+        lines = difflib.unified_diff(want.splitlines(), got.splitlines(), a, b, lineterm='', n=1)
+        return f'{b} prompt differs from {a}:\n' + '\n'.join(lines)[:2000]
 
     failures = 0
-    for name, case in CASES:
-        prompt = reference_render(ref, case)
-        errors = check_reference_shape(name, case, prompt, ref)
+    for name, case, expected in rows:
+        errors = []
+        if isinstance(expected, str):  # golden fixture
+            want = render(ref, case)
+            if want[0] != expected:
+                errors.append(diff(expected, want[0], 'golden', 'publisher'))
+        elif expected is None:
+            want = render(ref, case)
+            errors = check_reference_shape(name, case, want[0], ref)
+        else:  # SGLang-only case: stock render
+            want = expected
+        label = 'reference' if expected is None or isinstance(expected, str) else 'stock'
         if sgl is not None:
             try:
-                got = sglang_render(sgl, case)
+                got = render(sgl, case)
             except Exception as exc:
                 errors.append(f'sglang encode raised {type(exc).__name__}: {exc}')
-                got = None
             else:
-                if got != prompt:
-                    diff = '\n'.join(difflib.unified_diff(
-                        prompt.splitlines(), got.splitlines(),
-                        'publisher', 'sglang', lineterm='', n=1))
-                    errors.append('sglang prompt differs from publisher:\n' + diff[:2000])
+                if got[0] != want[0]:
+                    errors.append(diff(want[0], got[0], label, 'sglang'))
+                if got[1] != want[1]:
+                    errors.append(f'sglang image order {got[1]} != {label} {want[1]}')
         if errors:
             failures += 1
             print(f'[FAIL] {name}')
@@ -253,9 +359,9 @@ def main():
         else:
             print(f'[OK]   {name}')
             if args.verbose:
-                print('       ' + prompt.replace('\n', '\\n')[:220])
+                print('       ' + want[0].replace('\n', '\\n')[:220])
 
-    print(f'\n{len(CASES) - failures}/{len(CASES)} cases passed')
+    print(f'\n{len(rows) - failures}/{len(rows)} cases passed')
     sys.exit(1 if failures else 0)
 
 

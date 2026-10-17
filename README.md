@@ -234,6 +234,7 @@ runtime/sources.manifest pinned commits + sha256 of everything the TP4 images fe
 adapter/
   sitecustomize.py       import hooks that install the pieces below at process start
   encoding_compat.py     enable_thinking alias, publisher effort table, max_tokens cap
+  encoding_1017.py       DeepSeek-V4.1-Flash-1017 prompt rules: tool-result turns, namespaced tools, image order
   loop_abort.py          n-gram / identical-token / same-line stop on a live decode loop
   tp3_pad.py             TP=3 padding of heads / groups / vocab / draft experts
   engram_backend.py      EngramEmbedding replacement: exact rows from NVMe via a host callback
@@ -377,7 +378,16 @@ Where the 118 → 82 ms came from, in order of size:
   `enable_thinking` is copied onto `thinking` before encode/parse, so either name works.
   `python3 tests/test_thinking_alias.py` covers the alias; `python3 tests/test_chat_encoding.py`
   diffs tool and thinking-off renders against the checkpoint's `encoding/encoding.py` (and
-  against SGLang's `encoding_dsv41` inside the image).
+  against SGLang's `encoding_dsv41` inside the image, with its golden `encoding/tests` fixtures).
+- **1017 encoder rules.** DeepSeek-V4.1-Flash-1017 changed the reference encoder after SGLang
+  v0.5.21 ported it. `adapter/encoding_1017.py` brings `encoding_dsv41` to the 1017 rules: a
+  user message holding only tool results no longer starts a turn (with thinking on and no tool
+  definitions, reasoning before the results stays and the header stays `<think>`), namespaced
+  tools render as `namespace::name`, images are collected after tool results are sorted, tool
+  content lists keep non-text parts as `[Unsupported <type>]`, and non-object tool arguments
+  render as one `arguments` parameter. It checks the hash of every stock function it replaces
+  or relies on and keeps the stock encoder, with a log line, if one changed;
+  `tests/test_chat_encoding.py` then fails (`--stock` shows what the rules change).
 - **Completion cap.** Chat requests that omit `max_tokens` fill the remaining context on
   this OpenAI path. The 2× EXL3 recipe has no server-side cap either (vLLM does the same
   fill) but every one of its smokes and README curls sends `max_tokens`. This recipe now

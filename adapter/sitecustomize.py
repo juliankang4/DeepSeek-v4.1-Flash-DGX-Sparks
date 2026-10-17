@@ -74,6 +74,9 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.entrypoints.openai.encoding_dsv41':
             from encoding_compat import install_encoder
             install_encoder(module)
+            # DeepSeek-V4.1-Flash-1017 reference rules; keeps stock if the encoder drifted.
+            from encoding_1017 import install as install_encoding_1017
+            install_encoding_1017(module)
         elif module.__name__ == 'sglang.srt.entrypoints.openai.serving_chat':
             from encoding_compat import install_serving_chat
             install_serving_chat(module)
