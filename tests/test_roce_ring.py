@@ -8,14 +8,20 @@
   paths into peer maps for the TP rank order. The fixtures are a real four-Spark ring whose TP
   order runs the other way round the cables (TP 0,1,2,3 = ring 0,3,2,1).
 - every map pairs path i at both ends on the same PCIe domain.
+- mesh-up.sh, run under bash with stub tc/ip whose output outlasts a pipe, skips what exists
+  (a check that lets grep stop early fails under pipefail on tc's SIGPIPE), re-adds a lost
+  route, and refuses a rule tc reports not_in_hw.
 - in the image: the RoCEnante overlay selects the package from DSV41_ROCE_RING.
 
 No GPU, torch or network. usage: python3 tests/test_roce_ring.py
 """
 import importlib.util
 import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -133,6 +139,48 @@ class Plan(unittest.TestCase):
                     self.assertEqual(domain(m[r][p][i]), domain(m[p][r][i]), (r, p, i))
                     if (p - r) % 4 in (1, 3):
                         self.assertNotEqual(port(m[r][p][i]), port(m[p][r][i]), (r, p, i))
+
+
+STUB = r"""#!/usr/bin/env bash
+case "${0##*/} $*" in
+  *" add "*) echo "${0##*/} $*" >> "$MESH_LOG"; exit 0 ;;
+  "tc qdisc show"*) echo "qdisc clsact ffff: parent ffff:fff1" ;;
+  "tc -s filter show"*) printf '  skip_sw\n  %s in_hw_count 1\n' "$MESH_HW" ;;
+  "tc filter show"*) echo "filter protocol [34997] pref 49153 flower chain 0" ;;
+  "ip route show"*) [ -n "$MESH_ROUTE" ] || exit 0; echo "$MESH_ROUTE" ;;
+  *) exit 0 ;;
+esac
+printf '%*s\n' 1000000 ''
+"""
+
+
+class MeshUp(unittest.TestCase):
+    def test_checks_survive_early_exit(self):
+        rule = NS(intermediate_rank=0, ingress_netdev="enp1s0f0np0", preference=49153, handle=49153)
+        fake_plan = NS(tc_rules=[rule], routes=[NS(source_rank=0, destination_ipv4="10.0.0.2")],
+                       markers=[NS(source_rank=0, rdma_device="rocep1s0f0", udp_source_port=65535)])
+        fake_fabric = NS(tc_rule_command=lambda x, add: ["tc", "filter", "add", "dev", x.ingress_netdev],
+                         route_command=lambda r, add: ["ip", "route", "add", f"{r.destination_ipv4}/32"])
+        up, _down = plan.host_scripts(fake_plan, fake_fabric, 0)
+        route = "10.0.0.2 via 10.0.1.1 dev enp1s0f1np1"
+        cases = [("present", "in_hw", route, 0, []),
+                 ("route lost", "in_hw", "", 0, ["ip route add 10.0.0.2/32"]),
+                 ("not in hardware", "not_in_hw", route, 3, [])]
+        with tempfile.TemporaryDirectory() as tmp:
+            for cmd in ("tc", "ip", "systemctl", "sleep"):
+                (Path(tmp) / cmd).write_text(STUB)
+                (Path(tmp) / cmd).chmod(0o755)
+            (Path(tmp) / "mesh-up.sh").write_text(up)
+            log = Path(tmp) / "adds"
+            for name, hw, route_out, rc, adds in cases:
+                with self.subTest(name):
+                    log.write_text("")
+                    env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", MESH_LOG=str(log),
+                               MESH_HW=hw, MESH_ROUTE=route_out)
+                    r = subprocess.run(["bash", str(Path(tmp) / "mesh-up.sh")], env=env,
+                                       capture_output=True, text=True, timeout=60)
+                    self.assertEqual(r.returncode, rc, r.stdout[-300:] + r.stderr[-300:])
+                    self.assertEqual(log.read_text().splitlines(), adds)
 
 
 class ImageOverlay(unittest.TestCase):
